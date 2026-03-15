@@ -13,6 +13,8 @@
 
 [Download Latest Release](https://github.com/tony1223/better-agent-terminal/releases/latest)
 
+[繁體中文版](./README_zh_TW.md)
+
 </div>
 
 ---
