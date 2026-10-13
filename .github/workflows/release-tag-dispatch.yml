@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   dispatch:
+    if: ${{ github.repository == 'tony1223/better-agent-terminal' }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch release workflow on main

@@ -191,6 +191,7 @@ jobs:
   # latest-*.json from the pinned `manifests` release, and that is still written
   # once at the end by `release`, from whichever legs actually succeeded.
   create-release:
+    if: ${{ github.repository == 'tony1223/better-agent-terminal' }}
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -225,6 +226,7 @@ jobs:
           gh release edit "$RELEASE_TAG" --notes-file release-notes.md
 
   build:
+    if: ${{ github.repository == 'tony1223/better-agent-terminal' }}
     needs: [verify, create-release]
     strategy:
       fail-fast: false
@@ -888,7 +890,7 @@ jobs:
   # release page in the first place stops it.
   release:
     needs: [create-release, build]
-    if: ${{ always() && needs.create-release.result == 'success' }}
+    if: ${{ github.repository == 'tony1223/better-agent-terminal' && (always() && needs.create-release.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1044,7 +1046,7 @@ jobs:
     needs: [build, release]
     # `always()` for the same reason as `release`: a failed Linux or macOS leg
     # says nothing about whether the Windows installer is publishable.
-    if: ${{ always() && !contains(inputs.release_tag, '-pre') && needs.release.result == 'success' }}
+    if: ${{ github.repository == 'tony1223/better-agent-terminal' && (always() && !contains(inputs.release_tag, '-pre') && needs.release.result == 'success') }}
     # Deliberately still windows-latest: this job downloads a built artifact and
     # checksums it, so it never runs node-gyp and the VS 2026 problem that pins
     # the build legs to windows-2025 cannot reach it.
@@ -1304,7 +1306,7 @@ jobs:
     # bundles are independent deliverables, so they land as soon as they are
     # built rather than queueing behind the slowest desktop leg.
     needs: [create-release, bat-server-build]
-    if: ${{ always() && needs.create-release.result == 'success' }}
+    if: ${{ github.repository == 'tony1223/better-agent-terminal' && (always() && needs.create-release.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
