@@ -1,0 +1,2147 @@
+use crate::commands::pty as pty_cmd;
+use crate::event_hub::publish_runtime_event_to_windows;
+use crate::host_context::HostContext;
+use crate::remote_core::{
+    canonical_remote_channel, decode_remote_binary_frame, decode_remote_text_frame,
+    encode_remote_frame, is_proxied_remote_event, legacy_v1_event_args_to_params,
+    same_host_identity, RemoteCompression, RemoteFramePayload, REMOTE_COMPRESSION_GZIP,
+    REMOTE_PROTOCOL_LEGACY_V1, REMOTE_PROTOCOL_V2,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::protocol::WebSocket;
+use tungstenite::Message;
+
+const AUTH_TIMEOUT: Duration = Duration::from_secs(6);
+const INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+// The client loop's per-invoke deadline is authoritative (it can clean up the
+// pending map and reply with a descriptive error). The caller's recv_timeout is
+// only a backstop for a wedged/dead loop thread, so give it a little slack past
+// the real deadline instead of racing it.
+const PENDING_REPLY_GRACE: Duration = Duration::from_secs(5);
+// Send a WebSocket Ping on an idle connection at this cadence. Without it an
+// idle TCP/WS flow over NAT/Tailscale gets silently reaped: no bytes flow, the
+// router drops the mapping, and the half-open socket is never noticed until the
+// next invoke fails with "not connected to remote server". Periodic pings keep
+// the mapping warm AND surface a dead peer promptly (the write errors → the
+// loop breaks → `connected` flips false → the renderer auto-reconnects).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const CLIENT_DEVICE_ID_FILE: &str = "remote-client-id.json";
+const EVENT_OWNER_LIMIT: usize = 4096;
+
+type RemoteWebSocket = WebSocket<StreamOwned<ClientConnection, TcpStream>>;
+
+#[derive(Clone, Default)]
+pub struct RustRemoteClientState {
+    // Connections are pooled by identity (host, port, token) and shared by every
+    // window that targets the same host. `bindings` records which connection each
+    // window owns, so an invoke from one window can only ever ride that window's
+    // own connection — never another window's (or another host's). This keeps two
+    // windows on two different hosts fully isolated.
+    pool: Arc<Mutex<HashMap<ConnectionKey, Arc<RunningClient>>>>,
+    bindings: Arc<Mutex<HashMap<String, ConnectionKey>>>,
+    next_id: Arc<AtomicU64>,
+    event_sink: Option<RemoteEventSink>,
+    // Windows whose host-side target profile is itself a remote profile
+    // (client -> host -> downstream host). Their invokes ride a host-side
+    // profile context (`profile:open`), which proxies them to the downstream
+    // host instead of serving the host's own (empty) snapshot of the alias.
+    chains: Arc<Mutex<HashMap<String, ChainedProfile>>>,
+    // Serializes context (re)opens so concurrent invokes after a reconnect
+    // cannot open duplicate contexts that would double-deliver events.
+    attach_lock: Arc<Mutex<()>>,
+}
+
+struct ChainedProfile {
+    // Host-side profile id the window targets (the alias of the downstream).
+    profile_id: String,
+    // Connection the context was opened on. A context dies with its socket,
+    // so a context recorded against another (older) connection is stale.
+    client: Weak<RunningClient>,
+    context_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct ContextRoute {
+    window: String,
+    profile_id: String,
+}
+
+pub type RemoteEventSink = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct ConnectionKey {
+    host: String,
+    port: u16,
+    // SHA-256 of the token, hex-encoded. Never the plaintext token, so the key is
+    // safe to keep in maps and to render in logs (truncated, see Display).
+    token_hash: String,
+}
+
+impl ConnectionKey {
+    fn new(host: &str, port: u16, token: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        let token_hash = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self {
+            host: host.to_string(),
+            port,
+            token_hash,
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Log-safe: host:port plus the first 8 hex chars of the token hash.
+        let short = &self.token_hash[..8.min(self.token_hash.len())];
+        write!(f, "{}:{}#{}", self.host, self.port, short)
+    }
+}
+
+struct RunningClient {
+    host: String,
+    port: u16,
+    compression: RemoteCompression,
+    protocol: String,
+    // Host's app version as echoed in the auth-result `serverVersion` field,
+    // or None when the host predates the version-handshake fix. The renderer
+    // compares it to the client's own version to surface a skew warning
+    // (issue #115 was triggered by exactly that gap going undetected).
+    server_version: Option<String>,
+    // Additive host feature advertisement. Missing against older hosts.
+    capabilities: Option<Value>,
+    connected: Arc<AtomicBool>,
+    tx: mpsc::Sender<ClientCommand>,
+    // window_labels currently bound to this connection. The socket is torn down
+    // only when the last referrer is released, so sibling windows on the same
+    // host keep sharing it.
+    referrers: Arc<Mutex<HashSet<String>>>,
+    // Session/PTY ownership learned from invokes on this shared connection.
+    // Global host events still fan out to every referrer; high-volume
+    // resource events wake only the window that most recently used it.
+    event_owners: Arc<Mutex<HashMap<String, String>>>,
+    // Host profile contexts opened on this connection: contextId -> the window
+    // that owns it. Context-scoped events are delivered only to that window.
+    context_routes: Arc<Mutex<HashMap<String, ContextRoute>>>,
+}
+
+enum ClientCommand {
+    Invoke {
+        id: String,
+        channel: String,
+        args: Vec<Value>,
+        params: Option<Value>,
+        context_id: Option<String>,
+        timeout: Duration,
+        reply: mpsc::Sender<Result<Value, String>>,
+    },
+    Disconnect,
+}
+
+struct PendingInvoke {
+    channel: String,
+    deadline: Instant,
+    reply: mpsc::Sender<Result<Value, String>>,
+}
+
+struct RemoteConnection {
+    ws: RemoteWebSocket,
+    protocol: String,
+    compression: RemoteCompression,
+    server_version: Option<String>,
+    capabilities: Option<Value>,
+}
+
+#[derive(Debug)]
+struct AllowAnyServerCertificate;
+
+impl ServerCertVerifier for AllowAnyServerCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+impl RustRemoteClientState {
+    // Profile consumers own their subscription independently of desktop windows.
+    pub fn with_event_sink(sink: RemoteEventSink) -> Self {
+        Self {
+            event_sink: Some(sink),
+            ..Self::default()
+        }
+    }
+
+    pub fn connect(
+        &self,
+        app: HostContext,
+        host: String,
+        port: u16,
+        token: String,
+        fingerprint: String,
+        label: Option<String>,
+        window_id: Option<String>,
+    ) -> Result<Value, String> {
+        validate_connection_fields(&host, port, &token, &fingerprint)?;
+        reject_self_connection(&app, &fingerprint)?;
+        // Capture before `app` may be moved into the client_loop thread below;
+        // surfaced in the connect return so the renderer can compare against
+        // `serverVersion` and flag client/server skew (issue #115).
+        let client_version = app.version();
+        let label = label
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(default_client_label);
+        let key = ConnectionKey::new(&host, port, &token);
+
+        // Re-bind safety: if this window was bound to a different connection,
+        // release that first (tearing the old socket down only if this window was
+        // its last referrer). Covers an in-window host switch.
+        if let Some(window_label) = window_id.as_deref() {
+            let previous = self
+                .bindings
+                .lock()
+                .expect("remote client bindings lock")
+                .get(window_label)
+                .cloned();
+            if matches!(previous, Some(previous_key) if previous_key != key) {
+                self.release_binding(window_label);
+            }
+        }
+
+        // Reuse a live connection to the same host identity, otherwise open one.
+        let existing = self
+            .pool
+            .lock()
+            .expect("remote client pool lock")
+            .get(&key)
+            .cloned();
+        let client = match existing {
+            Some(client) if client.connected.load(Ordering::SeqCst) => client,
+            _ => {
+                let device_id = load_or_create_client_device_id(&app);
+                let connection = connect_socket(
+                    &host,
+                    port,
+                    &token,
+                    &fingerprint,
+                    &label,
+                    window_id.clone(),
+                    device_id,
+                )?;
+                // Another window (or its reconnect poll) may have finished dialing
+                // while we were authenticating. Only the chosen pooled connection
+                // may start an event loop; dropping the unused socket closes it.
+                self.get_or_insert_live_client(&key, || {
+                    let compression = connection.compression;
+                    let protocol = connection.protocol.clone();
+                    let server_version = connection.server_version.clone();
+                    let capabilities = connection.capabilities.clone();
+                    let (tx, rx) = mpsc::channel();
+                    let connected = Arc::new(AtomicBool::new(true));
+                    let connected_for_loop = Arc::clone(&connected);
+                    let referrers = Arc::new(Mutex::new(HashSet::new()));
+                    if let Some(window_label) = window_id.as_deref() {
+                        referrers
+                            .lock()
+                            .expect("remote client referrers lock")
+                            .insert(window_label.to_string());
+                    }
+                    let referrers_for_loop = Arc::clone(&referrers);
+                    let event_owners = Arc::new(Mutex::new(HashMap::new()));
+                    let event_owners_for_loop = Arc::clone(&event_owners);
+                    let context_routes = Arc::new(Mutex::new(HashMap::new()));
+                    let context_routes_for_loop = Arc::clone(&context_routes);
+                    let remote_origin = format!("{host}:{port}");
+                    let event_sink = self.event_sink.clone();
+                    thread::spawn(move || {
+                        client_loop(
+                            app,
+                            connection.ws,
+                            rx,
+                            connected_for_loop,
+                            compression,
+                            remote_origin,
+                            referrers_for_loop,
+                            event_owners_for_loop,
+                            context_routes_for_loop,
+                            event_sink,
+                        )
+                    });
+                    let client = Arc::new(RunningClient {
+                        host: host.clone(),
+                        port,
+                        compression,
+                        protocol,
+                        server_version,
+                        capabilities,
+                        connected,
+                        tx,
+                        referrers,
+                        event_owners,
+                        context_routes,
+                    });
+                    client
+                })
+            }
+        };
+
+        // Bind this window to the chosen connection.
+        if let Some(window_label) = window_id.as_deref() {
+            client
+                .referrers
+                .lock()
+                .expect("remote client referrers lock")
+                .insert(window_label.to_string());
+            self.bindings
+                .lock()
+                .expect("remote client bindings lock")
+                .insert(window_label.to_string(), key.clone());
+        }
+
+        let info = json!({
+            "host": client.host,
+            "port": client.port,
+            "compression": client.compression.as_str(),
+        });
+        // Surface client/server app version pair so the renderer can flag
+        // skew once per connect (issue #115's data-corruption window opened
+        // when a 3.1.22 host kept accepting 3.1.26 clients silently).
+        // `serverVersion` is None against hosts that predate this handshake.
+        let server_version = client
+            .server_version
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "connected": true,
+            "info": info,
+            "protocol": client.protocol,
+            "clientVersion": client_version,
+            "serverVersion": server_version,
+            "capabilities": client.capabilities,
+        }))
+    }
+
+    fn get_or_insert_live_client(
+        &self,
+        key: &ConnectionKey,
+        start: impl FnOnce() -> Arc<RunningClient>,
+    ) -> Arc<RunningClient> {
+        let mut pool = self.pool.lock().expect("remote client pool lock");
+        if let Some(client) = pool
+            .get(key)
+            .filter(|client| client.connected.load(Ordering::SeqCst))
+        {
+            return Arc::clone(client);
+        }
+        // Network I/O has already finished. Hold the lock only while starting and
+        // publishing the winner, so no competing dial can overwrite a live loop.
+        let client = start();
+        pool.insert(key.clone(), Arc::clone(&client));
+        client
+    }
+
+    /// Release a window's connection binding. The underlying socket is torn down
+    /// only when the last referrer is dropped, so sibling windows on the same host
+    /// keep sharing it. Returns false when the window had no binding.
+    fn release_binding(&self, window_label: &str) -> bool {
+        let key = {
+            let mut bindings = self.bindings.lock().expect("remote client bindings lock");
+            match bindings.remove(window_label) {
+                Some(key) => key,
+                None => return false,
+            }
+        };
+        let client = self
+            .pool
+            .lock()
+            .expect("remote client pool lock")
+            .get(&key)
+            .cloned();
+        let Some(client) = client else {
+            self.chains
+                .lock()
+                .expect("remote client chains lock")
+                .remove(window_label);
+            return true;
+        };
+        self.drop_chain(window_label);
+        let now_empty = {
+            let mut referrers = client
+                .referrers
+                .lock()
+                .expect("remote client referrers lock");
+            referrers.remove(window_label);
+            referrers.is_empty()
+        };
+        client
+            .event_owners
+            .lock()
+            .expect("remote client event owners lock")
+            .retain(|_, owner| owner != window_label);
+        if now_empty {
+            client.connected.store(false, Ordering::SeqCst);
+            let _ = client.tx.send(ClientCommand::Disconnect);
+            self.pool
+                .lock()
+                .expect("remote client pool lock")
+                .remove(&key);
+        }
+        true
+    }
+
+    pub fn disconnect(&self, window_label: &str) -> bool {
+        self.release_binding(window_label)
+    }
+
+    pub fn status(&self, window_label: &str) -> Value {
+        let key = self
+            .bindings
+            .lock()
+            .expect("remote client bindings lock")
+            .get(window_label)
+            .cloned();
+        let Some(key) = key else {
+            return json!({ "connected": false, "info": null });
+        };
+        let client = self
+            .pool
+            .lock()
+            .expect("remote client pool lock")
+            .get(&key)
+            .cloned();
+        let Some(client) = client else {
+            return json!({ "connected": false, "info": null });
+        };
+        let connected = client.connected.load(Ordering::SeqCst);
+        json!({
+            "connected": connected,
+            "info": if connected {
+                json!({
+                    "host": client.host,
+                    "port": client.port,
+                    "compression": client.compression.as_str(),
+                })
+            } else {
+                Value::Null
+            },
+            "capabilities": if connected {
+                client.capabilities.clone().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            },
+        })
+    }
+
+    pub fn invoke(
+        &self,
+        window_label: &str,
+        channel: &str,
+        args: Vec<Value>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        self.invoke_params(window_label, channel, args, None, timeout)
+    }
+
+    pub fn invoke_params(
+        &self,
+        window_label: &str,
+        channel: &str,
+        args: Vec<Value>,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        if channel.trim().is_empty() {
+            return Err("remote.invoke: channel is required".to_string());
+        }
+        let client = self.bound_client(window_label)?;
+        if let Some(resource) = event_owner_key_for_invoke(channel, &args) {
+            let mut owners = client
+                .event_owners
+                .lock()
+                .expect("remote client event owners lock");
+            if owners.len() >= EVENT_OWNER_LIMIT && !owners.contains_key(&resource) {
+                owners.clear();
+            }
+            owners.insert(resource, window_label.to_string());
+        }
+        let context_id = if routes_through_profile_context(channel) {
+            self.context_for(window_label, &client)?
+        } else {
+            None
+        };
+        self.send_invoke(&client, channel, args, params, context_id, timeout)
+    }
+
+    /// Route strictly to this window's own connection. If the window has no
+    /// live binding, fail closed — never fall back to another window's/host's
+    /// connection (that was the cross-host bleed bug).
+    fn bound_client(&self, window_label: &str) -> Result<Arc<RunningClient>, String> {
+        let key = self
+            .bindings
+            .lock()
+            .expect("remote client bindings lock")
+            .get(window_label)
+            .cloned();
+        let Some(key) = key else {
+            return Err("remote.invoke: not connected to remote server".to_string());
+        };
+        let client = self
+            .pool
+            .lock()
+            .expect("remote client pool lock")
+            .get(&key)
+            .cloned();
+        let Some(client) = client else {
+            return Err("remote.invoke: not connected to remote server".to_string());
+        };
+        if !client.connected.load(Ordering::SeqCst) {
+            return Err("remote.invoke: not connected to remote server".to_string());
+        }
+        Ok(client)
+    }
+
+    fn send_invoke(
+        &self,
+        client: &RunningClient,
+        channel: &str,
+        args: Vec<Value>,
+        params: Option<Value>,
+        context_id: Option<String>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        client
+            .tx
+            .send(ClientCommand::Invoke {
+                id: self.next_id(),
+                channel: channel.to_string(),
+                args,
+                params,
+                context_id,
+                timeout,
+                reply: reply_tx,
+            })
+            .map_err(|_| "remote.invoke: connection closed".to_string())?;
+        reply_rx
+            .recv_timeout(timeout + PENDING_REPLY_GRACE)
+            .map_err(|_| format!("Remote invoke timeout: {channel}"))?
+    }
+
+    /// Fire-and-forget invoke for best-effort cleanup (the reply is dropped).
+    fn send_detached(&self, client: &RunningClient, channel: &str, params: Value) {
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let _ = client.tx.send(ClientCommand::Invoke {
+            id: self.next_id(),
+            channel: channel.to_string(),
+            args: Vec::new(),
+            params: Some(params),
+            context_id: None,
+            timeout: INVOKE_TIMEOUT,
+            reply: reply_tx,
+        });
+    }
+
+    /// Bind a window to its host-side target profile. When that profile is
+    /// itself a remote profile on the host (client -> host -> downstream), open
+    /// a host profile context so the window's invokes and events are proxied to
+    /// the downstream host; otherwise the window keeps talking to the host
+    /// directly, exactly as before. Call after every successful `connect`.
+    pub fn attach_profile(&self, window_label: &str, profile_id: &str) -> Result<Value, String> {
+        let client = self.bound_client(window_label)?;
+        let _guard = self.attach_lock.lock().expect("remote client attach lock");
+        self.drop_chain(window_label);
+        let listing = self.send_invoke(
+            &client,
+            "profile:list",
+            Vec::new(),
+            None,
+            None,
+            INVOKE_TIMEOUT,
+        )?;
+        let target_is_remote = listing
+            .get("profiles")
+            .and_then(Value::as_array)
+            .and_then(|profiles| profiles.iter().find(|p| p["id"] == profile_id))
+            .is_some_and(|profile| profile["type"] == "remote");
+        if !target_is_remote {
+            return Ok(json!({ "chained": false }));
+        }
+        let context_id = self.open_context(window_label, &client, profile_id)?;
+        Ok(json!({ "chained": true, "contextId": context_id }))
+    }
+
+    /// The live context id for a chained window, reopening it when the one on
+    /// record died (socket replaced by a reconnect, or the host reported the
+    /// downstream unavailable). None for windows that are not chained.
+    fn context_for(
+        &self,
+        window_label: &str,
+        client: &Arc<RunningClient>,
+    ) -> Result<Option<String>, String> {
+        if !self
+            .chains
+            .lock()
+            .expect("remote client chains lock")
+            .contains_key(window_label)
+        {
+            return Ok(None);
+        }
+        let _guard = self.attach_lock.lock().expect("remote client attach lock");
+        let profile_id = {
+            let chains = self.chains.lock().expect("remote client chains lock");
+            // Detached while waiting for the lock: talk to the host directly.
+            let Some(chain) = chains.get(window_label) else {
+                return Ok(None);
+            };
+            let live = chain
+                .client
+                .upgrade()
+                .is_some_and(|recorded| Arc::ptr_eq(&recorded, client));
+            if let Some(id) = chain.context_id.as_ref().filter(|_| live) {
+                if client
+                    .context_routes
+                    .lock()
+                    .expect("remote client context routes lock")
+                    .contains_key(id)
+                {
+                    return Ok(Some(id.clone()));
+                }
+            }
+            chain.profile_id.clone()
+        };
+        self.open_context(window_label, client, &profile_id)
+            .map(Some)
+    }
+
+    fn open_context(
+        &self,
+        window_label: &str,
+        client: &Arc<RunningClient>,
+        profile_id: &str,
+    ) -> Result<String, String> {
+        let previous = self
+            .chains
+            .lock()
+            .expect("remote client chains lock")
+            .get(window_label)
+            .filter(|chain| {
+                chain
+                    .client
+                    .upgrade()
+                    .is_some_and(|recorded| Arc::ptr_eq(&recorded, client))
+            })
+            .and_then(|chain| chain.context_id.clone());
+        let opened = self.send_invoke(
+            client,
+            "profile:open",
+            Vec::new(),
+            Some(json!({ "profileId": profile_id })),
+            None,
+            INVOKE_TIMEOUT,
+        )?;
+        let context_id = opened
+            .get("contextId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "host did not return a profile context".to_string())?
+            .to_string();
+        {
+            let mut routes = client
+                .context_routes
+                .lock()
+                .expect("remote client context routes lock");
+            routes.retain(|_, route| route.window != window_label);
+            routes.insert(
+                context_id.clone(),
+                ContextRoute {
+                    window: window_label.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+            );
+        }
+        self.chains
+            .lock()
+            .expect("remote client chains lock")
+            .insert(
+                window_label.to_string(),
+                ChainedProfile {
+                    profile_id: profile_id.to_string(),
+                    client: Arc::downgrade(client),
+                    context_id: Some(context_id.clone()),
+                },
+            );
+        // A dead context still occupies one of the host's per-connection slots
+        // until it is explicitly closed.
+        if let Some(previous) = previous.filter(|previous| *previous != context_id) {
+            self.send_detached(client, "profile:close", json!({ "contextId": previous }));
+        }
+        Ok(context_id)
+    }
+
+    /// Forget a window's chained profile and release its host-side context.
+    fn drop_chain(&self, window_label: &str) {
+        let Some(chain) = self
+            .chains
+            .lock()
+            .expect("remote client chains lock")
+            .remove(window_label)
+        else {
+            return;
+        };
+        let (Some(client), Some(context_id)) = (chain.client.upgrade(), chain.context_id) else {
+            return;
+        };
+        client
+            .context_routes
+            .lock()
+            .expect("remote client context routes lock")
+            .remove(&context_id);
+        if client.connected.load(Ordering::SeqCst) {
+            self.send_detached(&client, "profile:close", json!({ "contextId": context_id }));
+        }
+    }
+
+    pub fn test_connection(
+        &self,
+        host: String,
+        port: u16,
+        token: String,
+        fingerprint: String,
+    ) -> Result<Value, String> {
+        validate_connection_fields(&host, port, &token, &fingerprint)?;
+        let mut connection = connect_socket(
+            &host,
+            port,
+            &token,
+            &fingerprint,
+            &default_client_label(),
+            None,
+            None,
+        )?;
+        let _ = connection.ws.close(None);
+        Ok(json!({ "ok": true }))
+    }
+
+    pub fn list_profiles(
+        &self,
+        host: String,
+        port: u16,
+        token: String,
+        fingerprint: String,
+    ) -> Result<Value, String> {
+        validate_connection_fields(&host, port, &token, &fingerprint)?;
+        let mut connection = connect_socket(
+            &host,
+            port,
+            &token,
+            &fingerprint,
+            &default_client_label(),
+            None,
+            None,
+        )?;
+        let result = invoke_socket(
+            &mut connection.ws,
+            connection.compression,
+            "profile:list",
+            Vec::new(),
+            INVOKE_TIMEOUT,
+        )?;
+        let _ = connection.ws.close(None);
+        let profiles = result
+            .get("profiles")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|profile| {
+                        json!({
+                            "id": profile.get("id").cloned().unwrap_or(Value::Null),
+                            "name": profile.get("name").cloned().unwrap_or(Value::Null),
+                            "type": profile.get("type").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let active_profile_ids = result
+            .get("activeProfileIds")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({ "profiles": profiles, "activeProfileIds": active_profile_ids }))
+    }
+
+    fn next_id(&self) -> String {
+        let seq = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("{}-{seq}", unix_ms())
+    }
+}
+
+fn event_owner_key(kind: &str, id: Option<&str>) -> Option<String> {
+    id.filter(|id| !id.is_empty())
+        .map(|id| format!("{kind}:{id}"))
+}
+
+/// Host profile contexts refuse `profile:*` and `app:*` (those manage the
+/// connection to the host itself), so chained windows send them to the host
+/// directly; everything else is proxied to the downstream host.
+fn routes_through_profile_context(channel: &str) -> bool {
+    let channel = canonical_remote_channel(channel);
+    !(channel.starts_with("profile:") || channel.starts_with("app:"))
+}
+
+fn event_owner_key_for_invoke(channel: &str, args: &[Value]) -> Option<String> {
+    let channel = canonical_remote_channel(channel);
+    if channel == "pty:create" {
+        return event_owner_key(
+            "pty",
+            args.first()
+                .and_then(|options| options.get("id"))
+                .and_then(Value::as_str),
+        );
+    }
+    if channel.starts_with("pty:") {
+        return event_owner_key("pty", args.first().and_then(Value::as_str));
+    }
+    if channel.starts_with("claude:")
+        && !matches!(
+            channel.as_str(),
+            "claude:auth-status"
+                | "claude:account-list"
+                | "claude:account-mark-warning-shown"
+                | "claude:auth-login-start"
+                | "claude:auth-login-submit-code"
+                | "claude:auth-login-cancel"
+                | "claude:get-cli-path"
+                | "claude:list-sessions"
+                | "claude:scan-skills"
+                | "claude:check-mcp-json-status"
+                | "claude:enable-all-project-mcp"
+        )
+    {
+        return event_owner_key("agent", args.first().and_then(Value::as_str));
+    }
+    None
+}
+
+fn event_owner_key_for_event(channel: &str, params: &Value) -> Option<String> {
+    if channel.starts_with("pty:") {
+        return event_owner_key("pty", params.get("id").and_then(Value::as_str));
+    }
+    if channel.starts_with("claude:") {
+        return event_owner_key("agent", params.get("sessionId").and_then(Value::as_str));
+    }
+    None
+}
+
+fn client_loop(
+    app: HostContext,
+    mut ws: RemoteWebSocket,
+    rx: mpsc::Receiver<ClientCommand>,
+    connected: Arc<AtomicBool>,
+    compression: RemoteCompression,
+    remote_origin: String,
+    referrers: Arc<Mutex<HashSet<String>>>,
+    event_owners: Arc<Mutex<HashMap<String, String>>>,
+    context_routes: Arc<Mutex<HashMap<String, ContextRoute>>>,
+    event_sink: Option<RemoteEventSink>,
+) {
+    let mut pending: HashMap<String, PendingInvoke> = HashMap::new();
+    let mut last_ping = Instant::now();
+    'connection: loop {
+        loop {
+            let command = match rx.try_recv() {
+                Ok(command) => command,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The pool/state no longer owns this socket. Do not keep
+                // receiving and publishing output from an orphaned connection.
+                Err(mpsc::TryRecvError::Disconnected) => break 'connection,
+            };
+            match command {
+                ClientCommand::Disconnect => {
+                    let _ = ws.close(None);
+                    connected.store(false, Ordering::SeqCst);
+                    drain_pending(&mut pending, "Disconnected");
+                    return;
+                }
+                ClientCommand::Invoke {
+                    id,
+                    channel,
+                    args,
+                    params,
+                    context_id,
+                    timeout,
+                    reply,
+                } => {
+                    log_remote_pty_write_args(&app, "remote-client.send", &channel, &args);
+                    let mut frame =
+                        json!({ "type": "invoke", "id": id, "channel": channel, "args": args });
+                    if let Some(params) = params {
+                        frame["params"] = params;
+                    }
+                    if let Some(context_id) = context_id {
+                        frame["contextId"] = Value::String(context_id);
+                    }
+                    match send_json_frame(&mut ws, frame, compression) {
+                        Ok(()) => {
+                            pending.insert(
+                                id,
+                                PendingInvoke {
+                                    channel,
+                                    // Honor the caller's timeout instead of a fixed 30s, so long
+                                    // session calls (agent:send-message at 300s) aren't killed
+                                    // mid-turn while the host is still waiting on the API.
+                                    deadline: Instant::now() + timeout,
+                                    reply,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                        }
+                    }
+                }
+            }
+        }
+
+        expire_pending(&mut pending);
+        // Keep the idle connection warm and detect a dead peer. A failed write
+        // here means the socket is gone; break so `connected` flips false and
+        // the client surfaces the drop (the renderer then auto-reconnects).
+        if last_ping.elapsed() >= KEEPALIVE_INTERVAL {
+            if ws.send(Message::Ping(Vec::<u8>::new().into())).is_err() {
+                break;
+            }
+            last_ping = Instant::now();
+        }
+        match ws.read() {
+            Ok(Message::Text(text)) if compression == RemoteCompression::None => {
+                match decode_remote_text_frame(&text) {
+                    Ok(frame) => {
+                        handle_frame(
+                            &app,
+                            &mut pending,
+                            frame,
+                            &remote_origin,
+                            &referrers,
+                            &event_owners,
+                            &context_routes,
+                            event_sink.as_ref(),
+                        );
+                    }
+                    Err(err) => {
+                        crate::commands::app::log_tauri(
+                            &app,
+                            &format!("[remote-client] invalid frame: {err}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            Ok(Message::Binary(bytes)) if compression == RemoteCompression::Gzip => {
+                match decode_remote_binary_frame(&bytes) {
+                    Ok(frame) => {
+                        handle_frame(
+                            &app,
+                            &mut pending,
+                            frame,
+                            &remote_origin,
+                            &referrers,
+                            &event_owners,
+                            &context_routes,
+                            event_sink.as_ref(),
+                        );
+                    }
+                    Err(err) => {
+                        crate::commands::app::log_tauri(
+                            &app,
+                            &format!("[remote-client] invalid frame: {err}"),
+                        );
+                        break;
+                    }
+                }
+            }
+            Ok(Message::Ping(bytes)) => {
+                let _ = ws.send(Message::Pong(bytes));
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(err))
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    let _ = ws.close(None);
+    connected.store(false, Ordering::SeqCst);
+    drain_pending(&mut pending, "Connection closed");
+    if let Some(sink) = event_sink {
+        sink("profile:status", json!({ "status": "unavailable" }));
+    }
+}
+
+fn log_remote_pty_write_args(app: &HostContext, phase: &str, channel: &str, args: &[Value]) {
+    if canonical_remote_channel(channel) != "pty:write" {
+        return;
+    }
+    let Some(id) = args.first().and_then(Value::as_str) else {
+        return;
+    };
+    let Some(data) = args.get(1).and_then(Value::as_str) else {
+        return;
+    };
+    if !pty_cmd::pty_input_trace_required(data) {
+        return;
+    }
+    pty_cmd::pty_input_debug_log(
+        app,
+        format!("{phase} id={id} {}", pty_cmd::describe_pty_input(data)),
+    );
+}
+
+/// Stamp host-origin `workspace:reload` payloads so the renderer can tell them
+/// apart from local-origin reloads. Host and client both label their main
+/// window "main", so windowId alone cannot distinguish a host broadcast from a
+/// reload targeted at this machine's own local window — without the tag, a
+/// local window would adopt the HOST's workspace list and the next local save
+/// would persist it over this machine's own data. Legacy hosts (<= v3.1.8)
+/// still send the bare workspace JSON string; wrap it so the tag survives.
+fn tag_remote_workspace_reload(params: Value, remote_origin: &str) -> Value {
+    match params {
+        Value::Object(mut map) => {
+            map.insert(
+                "remoteOrigin".to_string(),
+                Value::String(remote_origin.to_string()),
+            );
+            Value::Object(map)
+        }
+        Value::String(data) => json!({ "data": data, "remoteOrigin": remote_origin }),
+        other => other,
+    }
+}
+
+/// Profile ids are only unique inside one host (nearly every installation has
+/// a `default`). Stamp the source connection on proxied profile events so two
+/// remote windows attached to different hosts cannot consume each other's
+/// `profile:changed` broadcast.
+fn tag_remote_profile_changed(params: Value, remote_origin: &str) -> Value {
+    match params {
+        Value::Object(mut map) => {
+            map.insert(
+                "remoteOrigin".to_string(),
+                Value::String(remote_origin.to_string()),
+            );
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+fn handle_frame(
+    app: &HostContext,
+    pending: &mut HashMap<String, PendingInvoke>,
+    frame: Value,
+    remote_origin: &str,
+    referrers: &Mutex<HashSet<String>>,
+    event_owners: &Mutex<HashMap<String, String>>,
+    context_routes: &Mutex<HashMap<String, ContextRoute>>,
+    event_sink: Option<&RemoteEventSink>,
+) {
+    let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(frame_type, "invoke-result" | "invoke-error") {
+        let Some(id) = frame.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if let Some(pending) = pending.remove(id) {
+            let result = if frame_type == "invoke-error" {
+                Err(frame
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Remote invoke failed")
+                    .to_string())
+            } else {
+                Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+            };
+            let _ = pending.reply.send(result);
+        }
+        return;
+    }
+    if frame_type == "event" {
+        let Some(raw_channel) = frame.get("channel").and_then(Value::as_str) else {
+            return;
+        };
+        let channel = canonical_remote_channel(raw_channel);
+        if let Some(context_id) = frame.get("contextId").and_then(Value::as_str) {
+            if event_sink.is_none() {
+                handle_context_event(
+                    app,
+                    &frame,
+                    context_id,
+                    &channel,
+                    remote_origin,
+                    context_routes,
+                );
+            }
+            return;
+        }
+        if !is_proxied_remote_event(&channel) {
+            return;
+        }
+        let mut params = frame.get("params").cloned().unwrap_or_else(|| {
+            let args = frame
+                .get("args")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            legacy_v1_event_args_to_params(&channel, &args)
+        });
+        if let Some(sink) = event_sink {
+            sink(&channel, params);
+            return;
+        }
+        if channel == "workspace:reload" {
+            params = tag_remote_workspace_reload(params, remote_origin);
+        } else if channel == "profile:changed" {
+            params = tag_remote_profile_changed(params, remote_origin);
+        }
+        let all_windows = referrers
+            .lock()
+            .expect("remote client referrers lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let owner = event_owner_key_for_event(&channel, &params).and_then(|resource| {
+            event_owners
+                .lock()
+                .expect("remote client event owners lock")
+                .get(&resource)
+                .cloned()
+        });
+        let mut windows = owner
+            .filter(|owner| all_windows.contains(owner))
+            .map(|owner| vec![owner])
+            .unwrap_or(all_windows);
+        // Chained windows view a downstream host: this host's own sessions,
+        // terminals and workspace reloads are not theirs. Their resource events
+        // arrive context-scoped instead (handle_context_event).
+        if channel.starts_with("pty:")
+            || channel.starts_with("claude:")
+            || channel == "workspace:reload"
+        {
+            let chained = context_routes
+                .lock()
+                .expect("remote client context routes lock")
+                .values()
+                .map(|route| route.window.clone())
+                .collect::<HashSet<_>>();
+            windows.retain(|window| !chained.contains(window));
+        }
+        windows.sort();
+        publish_runtime_event_to_windows(app, &windows, &channel, params, "rust-remote-client");
+    }
+}
+
+/// Deliver an event the host scoped to one profile context to the window that
+/// owns the context. Stale or foreign context ids are dropped.
+fn handle_context_event(
+    app: &HostContext,
+    frame: &Value,
+    context_id: &str,
+    channel: &str,
+    remote_origin: &str,
+    context_routes: &Mutex<HashMap<String, ContextRoute>>,
+) {
+    let Some(route) = context_routes
+        .lock()
+        .expect("remote client context routes lock")
+        .get(context_id)
+        .cloned()
+    else {
+        return;
+    };
+    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    if channel == "profile:status" {
+        if params.get("status").and_then(Value::as_str) != Some("unavailable") {
+            return;
+        }
+        // The host lost the downstream. Forget the context and ask the window
+        // to reload: its workspace:load reopens a fresh context (reconnecting
+        // the downstream) and re-subscribes its sessions and terminals.
+        context_routes
+            .lock()
+            .expect("remote client context routes lock")
+            .remove(context_id);
+        crate::commands::app::log_tauri(
+            app,
+            &format!(
+                "[remote-client] profile context unavailable window={} profile={}",
+                route.window, route.profile_id
+            ),
+        );
+        let reload = tag_remote_workspace_reload(
+            json!({ "profileId": route.profile_id, "refresh": true }),
+            remote_origin,
+        );
+        publish_runtime_event_to_windows(
+            app,
+            &[route.window],
+            "workspace:reload",
+            reload,
+            "rust-remote-client",
+        );
+        return;
+    }
+    if !is_proxied_remote_event(channel) {
+        return;
+    }
+    let params = match channel {
+        "workspace:reload" => tag_remote_workspace_reload(params, remote_origin),
+        "profile:changed" => tag_remote_profile_changed(params, remote_origin),
+        _ => params,
+    };
+    publish_runtime_event_to_windows(app, &[route.window], channel, params, "rust-remote-client");
+}
+
+fn expire_pending(pending: &mut HashMap<String, PendingInvoke>) {
+    let now = Instant::now();
+    let expired = pending
+        .iter()
+        .filter_map(|(id, pending)| (pending.deadline <= now).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    for id in expired {
+        if let Some(pending) = pending.remove(&id) {
+            let _ = pending
+                .reply
+                .send(Err(format!("Remote invoke timeout: {}", pending.channel)));
+        }
+    }
+}
+
+fn drain_pending(pending: &mut HashMap<String, PendingInvoke>, message: &str) {
+    for (_, pending) in pending.drain() {
+        let _ = pending.reply.send(Err(message.to_string()));
+    }
+}
+
+fn generate_client_device_id() -> String {
+    let bytes = rand::random::<[u8; 16]>();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// A stable per-install identifier sent to the host as `clientInfo.deviceId`.
+// The host uses it to recognize this client on reconnect, so it only shows a
+// "new client connected" notification the first time this install connects.
+// Generated once and persisted under the app data dir.
+fn load_or_create_client_device_id(app: &HostContext) -> Option<String> {
+    let data_dir = app.data_dir().ok()?;
+    let path = data_dir.join(CLIENT_DEVICE_ID_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Some(existing) = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .as_ref()
+            .and_then(|value| value.get("deviceId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+        {
+            return Some(existing);
+        }
+    }
+    let id = generate_client_device_id();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::write(&path, json!({ "deviceId": id }).to_string());
+    Some(id)
+}
+
+fn connect_tcp_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("remote TCP address resolution failed for {host}:{port}: {err}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!(
+            "remote TCP address resolution returned no addresses for {host}:{port}"
+        ));
+    }
+
+    // TcpStream::connect delegates timeout policy to the OS. An unreachable LAN
+    // address can therefore leave a newly opened remote-profile window looking
+    // like a local window for tens of seconds. Share one explicit deadline across
+    // all resolved addresses so startup always reaches a useful error state.
+    let started = Instant::now();
+    let mut last_error = None;
+    for address in addresses {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if started.elapsed() >= timeout
+        || last_error
+            .as_ref()
+            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    {
+        return Err(format!(
+            "remote TCP connect timed out after {}s for {host}:{port}",
+            timeout.as_secs()
+        ));
+    }
+
+    Err(format!(
+        "remote TCP connect failed for {host}:{port}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown connection error".to_string())
+    ))
+}
+
+fn connect_socket(
+    host: &str,
+    port: u16,
+    token: &str,
+    fingerprint: &str,
+    label: &str,
+    window_id: Option<String>,
+    device_id: Option<String>,
+) -> Result<RemoteConnection, String> {
+    let pinned_fingerprint = normalize_fingerprint(fingerprint);
+    if pinned_fingerprint.is_empty() {
+        return Err("fingerprint is required for TLS pinning".to_string());
+    }
+    let tcp = connect_tcp_with_timeout(host, port, AUTH_TIMEOUT)?;
+    tcp.set_read_timeout(Some(AUTH_TIMEOUT))
+        .map_err(|err| format!("remote TCP timeout failed: {err}"))?;
+    tcp.set_write_timeout(Some(AUTH_TIMEOUT))
+        .map_err(|err| format!("remote TCP write timeout failed: {err}"))?;
+
+    let mut connection = ClientConnection::new(build_client_config()?, server_name_for(host)?)
+        .map_err(|err| format!("remote TLS setup failed: {err}"))?;
+    let mut tcp_for_handshake = tcp;
+    while connection.is_handshaking() {
+        connection
+            .complete_io(&mut tcp_for_handshake)
+            .map_err(|err| format!("remote TLS handshake failed: {err}"))?;
+    }
+    let peer_fingerprint = connection
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| fingerprint_sha256(cert.as_ref()))
+        .unwrap_or_default();
+    if normalize_fingerprint(&peer_fingerprint) != pinned_fingerprint {
+        return Err(format!(
+            "fingerprint mismatch: expected {}, got {}",
+            summarize_fingerprint(&pinned_fingerprint),
+            summarize_fingerprint(&peer_fingerprint)
+        ));
+    }
+
+    // The websocket upgrade and auth handshake below both block on reads for the
+    // server's response (the HTTP 101, then the auth-result frame). Keep the
+    // generous AUTH_TIMEOUT that is already on the socket in effect through both
+    // stages — only switch to the short non-blocking POLL_TIMEOUT once the
+    // connection is live (for the steady-state client loop). On relayed /
+    // high-latency paths (e.g. Tailscale DERP) the 101 can take several hundred
+    // ms; previously POLL_TIMEOUT was applied *before* the upgrade, so the read
+    // for the 101 timed out ~100ms after sending the upgrade and every such
+    // connection failed regardless of the much larger AUTH_TIMEOUT. (gh #116)
+    let tls = StreamOwned::new(connection, tcp_for_handshake);
+    let request = format!("wss://{host}:{port}/")
+        .into_client_request()
+        .map_err(|err| format!("remote websocket request failed: {err}"))?;
+    let (mut ws, _) = tungstenite::client(request, tls).map_err(|err| {
+        // A read timeout while waiting for the server's HTTP 101 surfaces as
+        // `Interrupted` (WouldBlock on Unix) or `Failure(Io(TimedOut))` (on
+        // Windows). Report it distinctly so a slow/relayed path is not mistaken
+        // for an auth or fingerprint failure. (gh #116)
+        let timed_out = match &err {
+            tungstenite::HandshakeError::Interrupted(_) => true,
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Io(io_err)) => {
+                io_err.kind() == io::ErrorKind::WouldBlock
+                    || io_err.kind() == io::ErrorKind::TimedOut
+            }
+            _ => false,
+        };
+        if timed_out {
+            format!(
+                "remote websocket upgrade timed out after {}s waiting for the server response (slow or relayed network path?)",
+                AUTH_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("remote websocket connect failed: {err}")
+        }
+    })?;
+    // Connection established; the auth loop below and the steady-state client
+    // loop both expect the short non-blocking poll timeout.
+    ws.get_ref()
+        .sock
+        .set_read_timeout(Some(POLL_TIMEOUT))
+        .map_err(|err| format!("remote stream polling timeout failed: {err}"))?;
+    let mut client_info = json!({
+        "appName": "Better Agent Terminal Desktop",
+        "appVersion": env!("BAT_APP_VERSION"),
+        "deviceName": label,
+        "label": label,
+        "platform": std::env::consts::OS,
+    });
+    // The host dedups "new client" notifications on this stable id.
+    if let Some(id) = device_id.as_deref().filter(|id| !id.is_empty()) {
+        client_info["deviceId"] = json!(id);
+    }
+    send_json_frame(
+        &mut ws,
+        json!({
+            "type": "auth",
+            "id": format!("{}-auth", unix_ms()),
+            "token": token,
+            "protocols": [REMOTE_PROTOCOL_V2, REMOTE_PROTOCOL_LEGACY_V1],
+            "compression": [REMOTE_COMPRESSION_GZIP],
+            "args": [label, { "windowId": window_id, "clientInfo": client_info }],
+        }),
+        RemoteCompression::None,
+    )?;
+    let deadline = Instant::now() + AUTH_TIMEOUT;
+    loop {
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if frame.get("type").and_then(Value::as_str) != Some("auth-result") {
+                    continue;
+                }
+                if let Some(error) = frame.get("error").and_then(Value::as_str) {
+                    return Err(error.to_string());
+                }
+                let protocol = frame
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .unwrap_or(REMOTE_PROTOCOL_LEGACY_V1)
+                    .to_string();
+                let compression = match frame.get("compression").and_then(Value::as_str) {
+                    Some(REMOTE_COMPRESSION_GZIP) => RemoteCompression::Gzip,
+                    _ => RemoteCompression::None,
+                };
+                let server_version = frame
+                    .get("serverVersion")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let capabilities = frame
+                    .get("capabilities")
+                    .filter(|value| value.is_object())
+                    .cloned();
+                return Ok(RemoteConnection {
+                    ws,
+                    protocol,
+                    compression,
+                    server_version,
+                    capabilities,
+                });
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(err))
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    return Err("remote auth timed out".to_string());
+                }
+            }
+            Err(err) => return Err(format!("remote auth failed: {err}")),
+        }
+    }
+}
+
+fn invoke_socket(
+    ws: &mut RemoteWebSocket,
+    compression: RemoteCompression,
+    channel: &str,
+    args: Vec<Value>,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let id = format!("{}-invoke", unix_ms());
+    send_json_frame(
+        ws,
+        json!({ "type": "invoke", "id": id, "channel": channel, "args": args }),
+        compression,
+    )?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match ws.read() {
+            Ok(Message::Text(text)) if compression == RemoteCompression::None => {
+                let Ok(frame) = decode_remote_text_frame(&text) else {
+                    continue;
+                };
+                if frame.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                    continue;
+                }
+                match frame.get("type").and_then(Value::as_str) {
+                    Some("invoke-result") => {
+                        return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    Some("invoke-error") => {
+                        return Err(frame
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Remote invoke failed")
+                            .to_string());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Message::Binary(bytes)) if compression == RemoteCompression::Gzip => {
+                let Ok(frame) = decode_remote_binary_frame(&bytes) else {
+                    continue;
+                };
+                if frame.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+                    continue;
+                }
+                match frame.get("type").and_then(Value::as_str) {
+                    Some("invoke-result") => {
+                        return Ok(frame.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    Some("invoke-error") => {
+                        return Err(frame
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Remote invoke failed")
+                            .to_string());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(err))
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(format!("Remote invoke timeout: {channel}"));
+                }
+            }
+            Err(err) => return Err(format!("Remote invoke failed: {err}")),
+        }
+    }
+}
+
+fn build_client_config() -> Result<Arc<ClientConfig>, String> {
+    let provider = rustls::crypto::ring::default_provider();
+    let config = ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .map_err(|err| format!("remote TLS protocol config failed: {err:?}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AllowAnyServerCertificate))
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+fn server_name_for(host: &str) -> Result<ServerName<'static>, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(host.to_string()).map_err(|_| "remote host is not a valid DNS name".into())
+}
+
+fn send_json_frame(
+    ws: &mut RemoteWebSocket,
+    frame: Value,
+    compression: RemoteCompression,
+) -> Result<(), String> {
+    match encode_remote_frame(&frame, compression)? {
+        RemoteFramePayload::Text(text) => ws.send(Message::Text(text.into())),
+        RemoteFramePayload::Binary(bytes) => ws.send(Message::Binary(bytes.into())),
+    }
+    .map_err(|err| format!("remote websocket send failed: {err}"))
+}
+
+fn validate_connection_fields(
+    host: &str,
+    port: u16,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), String> {
+    if host.trim().is_empty() || port == 0 || token.trim().is_empty() {
+        return Err("host, port, and token are required".to_string());
+    }
+    if fingerprint.trim().is_empty() {
+        return Err("fingerprint is required".to_string());
+    }
+    Ok(())
+}
+
+/// Refuse to dial the server running in this very process.
+///
+/// A desktop is host *and* client at once (both states are managed in `lib.rs`), so
+/// "connect to a host" can be pointed back here. Left alone it is the shortest
+/// possible cycle: this process's events would be forwarded to a client that is
+/// itself, and the relay hop budget would be spent on a ring of length one.
+///
+/// Compared by certificate fingerprint rather than host/port, because the same
+/// server answers on localhost, on the LAN address and over Tailscale — only the
+/// fingerprint is invariant across all three, and it is persisted, so it is a
+/// stable identity rather than a per-boot value.
+///
+/// Only `connect` carries this guard. `test_connection` and `list_profiles` open a
+/// socket, do one thing and close it; they establish no event flow, so they cannot
+/// form a ring. Dialling yourself there is pointless but harmless.
+fn reject_self_connection(app: &HostContext, fingerprint: &str) -> Result<(), String> {
+    // try_state, not state: on a headless host no server state may be registered,
+    // and state() panics on an unregistered type.
+    let own = app
+        .try_state::<crate::remote_server::RustRemoteServerState>()
+        .and_then(|state| state.own_host_identity());
+    if is_dialling_self(own.as_deref(), fingerprint) {
+        return Err(
+            "that is this app's own remote server — connecting to it would loop".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The decision behind `reject_self_connection`, split out so it is testable without
+/// a live host: `HostContext` cannot be constructed in a unit test on the desktop
+/// build, and standing up a real TLS server just to compare two strings would be
+/// testing the wrong thing.
+fn is_dialling_self(own_identity: Option<&str>, fingerprint: &str) -> bool {
+    own_identity.is_some_and(|own| same_host_identity(own, fingerprint))
+}
+
+fn default_client_label() -> String {
+    let suffix = unix_ms() % 1_000_000;
+    format!("Client-{suffix:06}")
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn fingerprint_sha256(cert_der: &[u8]) -> String {
+    let digest = Sha256::digest(cert_der);
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn normalize_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .filter(|chunk| chunk.len() == 2)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn summarize_fingerprint(value: &str) -> String {
+    let normalized = normalize_fingerprint(value);
+    if normalized.len() <= 23 {
+        normalized
+    } else {
+        format!("{}...", &normalized[..23])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dialling_this_hosts_own_server_is_refused() {
+        let own = "AA:BB:CC";
+        assert!(is_dialling_self(Some(own), own));
+        // Fingerprints arrive from a pasted pairing string, so casing and stray
+        // whitespace must not be a way past the check.
+        assert!(is_dialling_self(Some(own), " aa:bb:cc "));
+    }
+
+    #[test]
+    fn dialling_a_different_host_is_allowed() {
+        assert!(!is_dialling_self(Some("AA:BB:CC"), "DD:EE:FF"));
+        // No server running on this side: nothing to loop back into. A client-only
+        // build (BAT Mobile) is always in this state.
+        assert!(!is_dialling_self(None, "AA:BB:CC"));
+        // Neither side may treat "no identity" as matching anything.
+        assert!(!is_dialling_self(Some(""), ""));
+    }
+
+    #[test]
+    fn normalizes_fingerprint_like_node_client() {
+        assert_eq!(
+            normalize_fingerprint("aa bb:cc-dd"),
+            "AA:BB:CC:DD".to_string()
+        );
+        assert_eq!(summarize_fingerprint("AA:BB").as_str(), "AA:BB");
+    }
+
+    #[test]
+    fn validates_remote_connection_fields() {
+        assert!(validate_connection_fields("localhost", 9876, "token", "AA").is_ok());
+        assert!(validate_connection_fields("", 9876, "token", "AA").is_err());
+        assert!(validate_connection_fields("localhost", 0, "token", "AA").is_err());
+        assert!(validate_connection_fields("localhost", 9876, "", "AA").is_err());
+        assert!(validate_connection_fields("localhost", 9876, "token", "").is_err());
+    }
+
+    #[test]
+    fn tcp_connect_with_timeout_reaches_available_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let stream = connect_tcp_with_timeout("127.0.0.1", port, Duration::from_secs(1))
+            .expect("local listener should accept a bounded TCP dial");
+
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+    }
+
+    #[test]
+    fn tcp_connect_with_timeout_rejects_expired_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let error = connect_tcp_with_timeout("127.0.0.1", port, Duration::ZERO)
+            .expect_err("an expired deadline must not fall back to an unbounded OS connect");
+
+        assert!(error.contains("timed out after 0s"), "got: {error}");
+    }
+
+    #[test]
+    fn connection_key_is_stable_and_token_safe() {
+        let a = ConnectionKey::new("host", 9001, "secret-token");
+        let b = ConnectionKey::new("host", 9001, "secret-token");
+        let c = ConnectionKey::new("host", 9001, "other-token");
+        let d = ConnectionKey::new("host", 9002, "secret-token");
+        assert_eq!(a, b, "same (host, port, token) must collapse to one key");
+        assert_ne!(a, c, "different token must be a different connection");
+        assert_ne!(a, d, "different port must be a different connection");
+        let shown = a.to_string();
+        assert!(shown.starts_with("host:9001#"));
+        assert!(
+            !shown.contains("secret-token"),
+            "Display must never leak the plaintext token"
+        );
+    }
+
+    #[test]
+    fn resource_events_follow_the_window_that_invoked_them() {
+        assert_eq!(
+            event_owner_key_for_invoke("pty:create", &[json!({ "id": "term-1", "cwd": "." })]),
+            Some("pty:term-1".to_string())
+        );
+        assert_eq!(
+            event_owner_key_for_invoke("agent:send-message", &[json!("session-1")]),
+            Some("agent:session-1".to_string())
+        );
+        assert_eq!(
+            event_owner_key_for_event(
+                "claude:stream",
+                &json!({ "sessionId": "session-1", "data": { "text": "hi" } })
+            ),
+            Some("agent:session-1".to_string())
+        );
+        assert_eq!(
+            event_owner_key_for_event("pty:output", &json!({ "id": "term-1", "data": "hi" })),
+            Some("pty:term-1".to_string())
+        );
+        assert_eq!(
+            event_owner_key_for_event("workspace:reload", &json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn tags_remote_workspace_reload_payloads() {
+        // Object payloads gain the origin tag in place.
+        let tagged = tag_remote_workspace_reload(
+            json!({ "windowId": "main", "profileId": "default", "data": "{}" }),
+            "hostb:9876",
+        );
+        assert_eq!(tagged["remoteOrigin"], json!("hostb:9876"));
+        assert_eq!(tagged["windowId"], json!("main"));
+        // Legacy bare-string payloads are wrapped so the tag survives.
+        let wrapped =
+            tag_remote_workspace_reload(Value::String("{\"workspaces\":[]}".into()), "hostb:9876");
+        assert_eq!(wrapped["remoteOrigin"], json!("hostb:9876"));
+        assert_eq!(wrapped["data"], json!("{\"workspaces\":[]}"));
+    }
+
+    #[test]
+    fn tags_remote_profile_changed_payloads() {
+        let tagged = tag_remote_profile_changed(
+            json!({
+                "profiles": [{ "id": "default", "name": "Default", "type": "local" }],
+                "activeProfileIds": ["default"],
+            }),
+            "hostb:9876",
+        );
+        assert_eq!(tagged["remoteOrigin"], json!("hostb:9876"));
+        assert_eq!(tagged["profiles"][0]["id"], json!("default"));
+    }
+
+    #[test]
+    fn invoke_without_binding_fails_closed() {
+        let state = RustRemoteClientState::default();
+        let err = state
+            .invoke(
+                "win-A",
+                "pty:read-buffer",
+                Vec::new(),
+                Duration::from_secs(1),
+            )
+            .expect_err("an unbound window must not reach any connection");
+        assert!(err.contains("not connected"));
+    }
+
+    // Build a fake pooled connection without opening a socket, so the
+    // pool/binding/referrer lifecycle can be exercised in isolation.
+    fn fake_client() -> Arc<RunningClient> {
+        let (tx, _rx) = mpsc::channel();
+        Arc::new(RunningClient {
+            host: "host".to_string(),
+            port: 9001,
+            compression: RemoteCompression::None,
+            protocol: "v2".to_string(),
+            server_version: None,
+            capabilities: None,
+            connected: Arc::new(AtomicBool::new(true)),
+            tx,
+            referrers: Arc::new(Mutex::new(HashSet::new())),
+            event_owners: Arc::new(Mutex::new(HashMap::new())),
+            context_routes: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    #[test]
+    fn concurrent_dials_start_only_one_pooled_event_loop() {
+        let state = RustRemoteClientState::default();
+        let key = ConnectionKey::new("host", 9001, "tok");
+        let ready = Arc::new(std::sync::Barrier::new(4));
+        let starts = Arc::new(AtomicU64::new(0));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let state = state.clone();
+                let key = key.clone();
+                let ready = Arc::clone(&ready);
+                let starts = Arc::clone(&starts);
+                thread::spawn(move || {
+                    // All callers saw an empty pool before their network dial.
+                    assert!(!state.pool.lock().unwrap().contains_key(&key));
+                    ready.wait();
+                    state.get_or_insert_live_client(&key, || {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        fake_client()
+                    })
+                })
+            })
+            .collect();
+        let clients: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "one event loop per host");
+        for client in &clients {
+            assert!(Arc::ptr_eq(client, &clients[0]));
+        }
+        assert!(Arc::ptr_eq(&state.pool.lock().unwrap()[&key], &clients[0]));
+    }
+
+    #[test]
+    fn redial_replaces_a_dead_connection_but_reuses_a_live_one() {
+        let state = RustRemoteClientState::default();
+        let key = ConnectionKey::new("host", 9001, "tok");
+        let old = state.get_or_insert_live_client(&key, fake_client);
+        let shared = state.get_or_insert_live_client(&key, || panic!("live client must be reused"));
+        assert!(Arc::ptr_eq(&old, &shared));
+        old.connected.store(false, Ordering::SeqCst);
+        let replacement = state.get_or_insert_live_client(&key, fake_client);
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        assert!(replacement.connected.load(Ordering::SeqCst));
+    }
+
+    type SentFrames = Arc<Mutex<Vec<(String, Option<String>, Value)>>>;
+
+    // A fake pooled connection whose command channel is served by a stub host
+    // thread, so invoke/attach behavior can be asserted end to end.
+    fn stub_host_client(
+        state: &RustRemoteClientState,
+        windows: &[&str],
+    ) -> (Arc<RunningClient>, SentFrames) {
+        let (tx, rx) = mpsc::channel::<ClientCommand>();
+        let client = Arc::new(RunningClient {
+            host: "host".to_string(),
+            port: 9001,
+            compression: RemoteCompression::None,
+            protocol: "v2".to_string(),
+            server_version: None,
+            capabilities: None,
+            connected: Arc::new(AtomicBool::new(true)),
+            tx,
+            referrers: Arc::new(Mutex::new(HashSet::new())),
+            event_owners: Arc::new(Mutex::new(HashMap::new())),
+            context_routes: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let key = ConnectionKey::new("host", 9001, "tok");
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&client));
+        for window in windows {
+            client
+                .referrers
+                .lock()
+                .unwrap()
+                .insert((*window).to_string());
+            state
+                .bindings
+                .lock()
+                .unwrap()
+                .insert((*window).to_string(), key.clone());
+        }
+        let sent: SentFrames = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&sent);
+        thread::spawn(move || {
+            let mut opened = 0;
+            while let Ok(command) = rx.recv() {
+                let ClientCommand::Invoke {
+                    channel,
+                    params,
+                    context_id,
+                    reply,
+                    ..
+                } = command
+                else {
+                    continue;
+                };
+                log.lock().unwrap().push((
+                    channel.clone(),
+                    context_id,
+                    params.clone().unwrap_or(Value::Null),
+                ));
+                let result = match channel.as_str() {
+                    "profile:list" => json!({ "profiles": [
+                        { "id": "default", "type": "local" },
+                        { "id": "ap01", "type": "remote" },
+                    ] }),
+                    "profile:open" => {
+                        opened += 1;
+                        json!({ "contextId": format!("pc-{opened}"), "status": "ready" })
+                    }
+                    _ => json!("ok"),
+                };
+                let _ = reply.send(Ok(result));
+            }
+        });
+        (client, sent)
+    }
+
+    fn sent_for(sent: &SentFrames, channel: &str) -> Vec<(Option<String>, Value)> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _, _)| c == channel)
+            .map(|(_, context, params)| (context.clone(), params.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn chained_profiles_ride_a_host_profile_context() {
+        let state = RustRemoteClientState::default();
+        let (client, sent) = stub_host_client(&state, &["win-chained", "win-direct"]);
+        let timeout = Duration::from_secs(5);
+
+        // A local target stays a direct connection; a remote target opens a context.
+        let direct = state.attach_profile("win-direct", "default").unwrap();
+        assert_eq!(direct, json!({ "chained": false }));
+        let chained = state.attach_profile("win-chained", "ap01").unwrap();
+        assert_eq!(chained, json!({ "chained": true, "contextId": "pc-1" }));
+        assert_eq!(
+            sent_for(&sent, "profile:open"),
+            vec![(None, json!({ "profileId": "ap01" }))]
+        );
+
+        // Workload channels carry the context; host-management channels and
+        // direct windows do not.
+        state
+            .invoke(
+                "win-chained",
+                "workspace:load",
+                vec![json!("ap01")],
+                timeout,
+            )
+            .unwrap();
+        state
+            .invoke("win-chained", "profile:list", vec![], timeout)
+            .unwrap();
+        state
+            .invoke(
+                "win-direct",
+                "workspace:load",
+                vec![json!("default")],
+                timeout,
+            )
+            .unwrap();
+        let loads = sent_for(&sent, "workspace:load");
+        assert_eq!(loads[0].0.as_deref(), Some("pc-1"));
+        assert_eq!(loads[1].0, None);
+        assert!(sent_for(&sent, "profile:list")
+            .iter()
+            .all(|(context, _)| context.is_none()));
+
+        // The host reported the downstream unavailable (route dropped): the next
+        // invoke reopens a fresh context and releases the dead one's slot.
+        client.context_routes.lock().unwrap().remove("pc-1");
+        state
+            .invoke(
+                "win-chained",
+                "pty:write",
+                vec![json!("t1"), json!("x")],
+                timeout,
+            )
+            .unwrap();
+        assert_eq!(sent_for(&sent, "pty:write")[0].0.as_deref(), Some("pc-2"));
+        assert_eq!(
+            sent_for(&sent, "profile:close"),
+            vec![(None, json!({ "contextId": "pc-1" }))]
+        );
+
+        // Disconnecting the chained window releases its context but keeps the
+        // shared socket for the direct sibling.
+        assert!(state.disconnect("win-chained"));
+        state
+            .invoke(
+                "win-direct",
+                "workspace:load",
+                vec![json!("default")],
+                timeout,
+            )
+            .unwrap();
+        assert_eq!(
+            sent_for(&sent, "profile:close").last().cloned(),
+            Some((None, json!({ "contextId": "pc-2" })))
+        );
+        assert!(client.context_routes.lock().unwrap().is_empty());
+        assert!(state.chains.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_management_channels_bypass_profile_contexts() {
+        assert!(routes_through_profile_context("workspace:load"));
+        assert!(routes_through_profile_context("agent:send-message"));
+        assert!(routes_through_profile_context("pty:create"));
+        assert!(!routes_through_profile_context("profile:list"));
+        assert!(!routes_through_profile_context("app:get-version"));
+    }
+
+    fn register_fake_client(state: &RustRemoteClientState, windows: &[&str]) -> ConnectionKey {
+        let key = ConnectionKey::new("host", 9001, "tok");
+        let client = fake_client();
+        state
+            .pool
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&client));
+        for window in windows {
+            client
+                .referrers
+                .lock()
+                .unwrap()
+                .insert((*window).to_string());
+            state
+                .bindings
+                .lock()
+                .unwrap()
+                .insert((*window).to_string(), key.clone());
+        }
+        key
+    }
+
+    #[test]
+    fn last_referrer_release_tears_down_shared_connection() {
+        let state = RustRemoteClientState::default();
+        let key = register_fake_client(&state, &["win-A", "win-B"]);
+
+        // Each bound window sees its own connection as live.
+        assert_eq!(state.status("win-A")["connected"], json!(true));
+        assert_eq!(state.status("win-B")["connected"], json!(true));
+
+        // Releasing one referrer keeps the shared socket alive for the sibling.
+        assert!(state.disconnect("win-A"));
+        assert!(state.pool.lock().unwrap().contains_key(&key));
+        assert_eq!(state.status("win-A")["connected"], json!(false));
+        assert_eq!(state.status("win-B")["connected"], json!(true));
+
+        // Releasing the last referrer tears the connection down.
+        assert!(state.disconnect("win-B"));
+        assert!(!state.pool.lock().unwrap().contains_key(&key));
+        assert!(!state.disconnect("win-B"), "second release is a no-op");
+    }
+}

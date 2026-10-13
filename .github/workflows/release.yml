@@ -1,114 +1,1336 @@
 name: Release
+run-name: Release ${{ inputs.release_tag }}
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to build, for example v2.9.0-pre.23'
+        required: true
+        type: string
+      run_verification:
+        description: 'Run release verification checks before publishing'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  RUN_RELEASE_VERIFICATION: ${{ inputs.run_verification }}
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            platform: win
-          - os: macos-latest
-            platform: mac
-          - os: ubuntu-latest
-            platform: linux
-
-    runs-on: ${{ matrix.os }}
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      win_labels: ${{ steps.win-runner.outputs.labels }}
 
     steps:
+      - name: Skip release verification
+        if: env.RUN_RELEASE_VERIFICATION != 'true'
+        run: echo "Skipping release verification. Re-run manually with run_verification=true to enable it."
+
+      # Decides which runner the two Windows legs land on. This lives in `verify`
+      # rather than a job of its own because verify is a ~5s no-op by default
+      # (every step above is gated on run_verification) and `build` already needs
+      # it — so the decision costs no extra queue time on the critical path.
+      #
+      # Windows *is* the critical path: 7.1 min on v3.1.53 against macOS's 4.6.
+      # Most of that gap is work a reused machine would not repeat — `Setup Rust`
+      # 39s (macOS: 8s), `Cache Rust build outputs` 25s (macOS: 8s), and ~130s of
+      # cargo. Keeping src-tauri/target between runs lets CARGO_INCREMENTAL do the
+      # rest: measured locally, our crate goes 196.9s -> 10.3-12.8s once the
+      # target dir is warm. That is the whole point of the self-hosted leg.
+      #
+      # Note the trade: one runner executes one job at a time, so the two Windows
+      # legs (all-in-one and lightweight) go from parallel to sequential. That is
+      # still a win only because the second leg reuses the first's target dir —
+      # they differ by bundle_mode, which the Rust build barely notices. Register
+      # a second runner if that assumption ever stops holding.
+      #
+      # Opt in by setting the repo variable WIN_RUNNER_LABELS to a JSON array of
+      # the runner's labels — ["self-hosted","Windows","X64","bat-win"] is what
+      # scripts/setup-self-hosted-windows-runner.ps1 registers. Unset means the
+      # pinned hosted image, so every self-hosted change below is inert until a
+      # runner actually exists and someone sets the variable.
+      #
+      # A job waiting on a self-hosted runner that never comes back queues for 24
+      # hours before failing, which would be a terrible way to find out the VM is
+      # off. So if RUNNER_STATUS_TOKEN is set (a fine-grained PAT with
+      # Administration: Read — GITHUB_TOKEN cannot be granted that scope, it is
+      # not in the permissions list at all) we confirm the runner is online first
+      # and quietly fall back to the hosted image when it is not. Without that PAT
+      # the variable is taken on trust, which means turning the VM off requires
+      # clearing the variable too.
+      - name: Decide where the Windows legs run
+        id: win-runner
+        env:
+          WANTED: ${{ vars.WIN_RUNNER_LABELS }}
+          GH_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          # No `set -e` on purpose: every failure path below has to end in a
+          # valid `labels` output, because runs-on calls fromJSON on it. A step
+          # that dies here would take the whole release with it, and the honest
+          # answer to "we could not tell" is the pinned hosted image, not a
+          # broken run.
+          set -uo pipefail
+          # Pinned, NOT windows-latest. `windows-latest` has rolled onto the
+          # win25-vs2026 image line, which ships Visual Studio 2026 at
+          # C:\Program Files\Microsoft Visual Studio\18\Enterprise. The node-gyp
+          # that pnpm 10.33.2 bundles (11.5.0) cannot read that install — it
+          # reports `unknown version "undefined"` and gives up. `windows-2025`
+          # still ships VS Enterprise 2022 17.14 under ...\2022\Enterprise,
+          # which node-gyp does understand.
+          #
+          # This only matters when a native dep has to compile. Normally
+          # prebuild-install fetches a prebuilt binary and node-gyp never runs,
+          # which is why this stayed invisible until v3.2.2-pre.1: better-sqlite3's
+          # prebuild download hit a `socket hang up`, fell back to compiling, and
+          # took the whole win all-in-one leg down with it. Pinning turns that
+          # class of flake back into "compiles from source, ~1 min slower".
+          #
+          # Caveat for whoever revisits this: the compile fallback has never
+          # actually succeeded in CI here (prebuilds always worked), so VS 2022
+          # being present is a well-founded bet, not a verified green build.
+          # node-gyp also logged ERR_CHILD_PROCESS_STDIO_MAXBUFFER while probing,
+          # which may bite on any image. Revisit when windows-2025 retires or
+          # pnpm ships a node-gyp that knows VS 2026.
+          hosted='["windows-2025"]'
+          emit() { echo "labels=$1" >> "$GITHUB_OUTPUT"; echo "Windows legs -> $1"; }
+
+          if [ -z "${WANTED:-}" ]; then
+            echo "WIN_RUNNER_LABELS is unset."
+            emit "$hosted"; exit 0
+          fi
+          if ! printf '%s' "$WANTED" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            echo "::warning::WIN_RUNNER_LABELS is not a non-empty JSON array: $WANTED"
+            emit "$hosted"; exit 0
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "No RUNNER_STATUS_TOKEN, so the runner's liveness cannot be checked."
+            emit "$WANTED"; exit 0
+          fi
+
+          runners=$(gh api "repos/$GH_REPO/actions/runners" 2>/dev/null) || runners=''
+          if [ -z "$runners" ]; then
+            echo "::warning::Could not read the runner list; trusting WIN_RUNNER_LABELS."
+            emit "$WANTED"; exit 0
+          fi
+          # Count runners that are online AND carry every requested label.
+          # `busy` is deliberately not checked: a runner mid-job frees up on its
+          # own, and failing over for that would give up the warm target dir for
+          # no reason.
+          count=$(printf '%s' "$runners" | jq --argjson want "$WANTED" '
+            [ .runners[]
+              | select(.status == "online")
+              | select([.labels[].name] as $have | all($want[]; . as $l | ($have | index($l)) != null))
+            ] | length')
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "$count online runner(s) carry $WANTED."
+            emit "$WANTED"
+          else
+            echo "::warning::No online runner carries $WANTED; using $hosted instead."
+            emit "$hosted"
+          fi
+
       - name: Checkout code
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup pnpm
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
 
       - name: Setup Node.js
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            node-sidecar/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Rebuild @lydell/node-pty for Electron (Windows)
-        if: matrix.platform == 'win'
-        run: npx --yes @electron/rebuild
-
-      - name: Rebuild @lydell/node-pty for Electron (macOS/Linux)
-        if: matrix.platform != 'win'
-        run: npx --yes @electron/rebuild
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Extract version from tag
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
         id: version
         shell: bash
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${RELEASE_TAG}" >> $GITHUB_OUTPUT
 
-      - name: Update version and build
+      - name: Update version metadata
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
-        run: node scripts/build-version.js
+        run: pnpm run update:release-version
 
-      - name: Package for Windows
-        if: matrix.platform == 'win'
-        run: npx electron-builder --win --publish never
+      - name: Verify Tauri bundle resources
+        if: env.RUN_RELEASE_VERIFICATION == 'true'
+        run: pnpm run verify:tauri-release-ci
 
-      - name: Package for macOS
-        if: matrix.platform == 'mac'
-        run: npx electron-builder --mac --publish never
+  # The release page is opened BEFORE anything is built, so each platform can
+  # publish its own installer the moment that platform finishes instead of every
+  # download waiting on the slowest leg. A leg that fails simply never uploads:
+  # its installer is missing from the page, and the rest of the release stands.
+  # (Previously `release` needed the whole matrix, so one flaky leg withheld
+  # every platform's build.)
+  #
+  # Auto-update is unaffected by the page being briefly incomplete: clients read
+  # latest-*.json from the pinned `manifests` release, and that is still written
+  # once at the end by `release`, from whichever legs actually succeeded.
+  create-release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Open the release page with no assets yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists (re-run?); reusing it."
+          else
+            PRERELEASE=()
+            case "$RELEASE_TAG" in *-pre*) PRERELEASE=(--prerelease);; esac
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              "${PRERELEASE[@]}"
+          fi
+          # Say so on the page itself, so an incomplete asset list reads as
+          # "still working" rather than "this release is broken". `release`
+          # strips this line once every leg has reported in.
+          BANNER='> ⏳ **Builds in progress.** Installers are uploaded as each platform finishes.'
+          # Strip first, then prepend: re-running a partially failed release must
+          # not stack a second banner on top of the first.
+          body=$(gh release view "$RELEASE_TAG" --json body --jq .body \
+                   | sed '/^> ⏳ \*\*Builds in progress\.\*\*/,+1d' \
+                   | sed '/^> ⚠️ \*\*Some platforms did not build\.\*\*/,+1d')
+          printf '%s\n\n%s\n' "$BANNER" "$body" > release-notes.md
+          gh release edit "$RELEASE_TAG" --notes-file release-notes.md
 
-      - name: Package for Linux
-        if: matrix.platform == 'linux'
-        run: npx electron-builder --linux --publish never
+  build:
+    needs: [verify, create-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # os is inert for the win legs (runs-on below takes verify's decision
+          # instead), but it is kept in sync with that decision's pinned default
+          # so removing the indirection can never silently reintroduce
+          # windows-latest. See "Decide where the Windows legs run" for why.
+          - os: windows-2025
+            platform: win
+            arch: x64
+            artifact: release-win-all-in-one
+            release_exts: '.exe'
+            bundle: nsis
+            bundle_mode: all-in-one
+            asset_mode: all-in-one
+            prerelease: true
+          - os: windows-2025
+            platform: win
+            arch: x64
+            artifact: release-win-lightweight
+            release_exts: '.exe'
+            bundle: nsis
+            bundle_mode: lightweight
+            asset_mode: lightweight
+            prerelease: true
+          - os: macos-15-intel
+            platform: mac
+            arch: x64
+            artifact: release-mac-x64
+            release_exts: '.dmg'
+            bundle: dmg,app
+            bundle_mode: all-in-one
+            asset_mode: ''
+            prerelease: false
+          - os: macos-15-intel
+            platform: mac
+            arch: x64
+            artifact: release-mac-x64-lightweight
+            release_exts: '.dmg'
+            bundle: dmg,app
+            bundle_mode: lightweight
+            asset_mode: lightweight
+            prerelease: false
+          - os: macos-14
+            platform: mac
+            arch: arm64
+            artifact: release-mac-arm64-all-in-one
+            release_exts: '.dmg'
+            bundle: dmg,app
+            bundle_mode: all-in-one
+            asset_mode: all-in-one
+            prerelease: true
+          - os: macos-14
+            platform: mac
+            arch: arm64
+            artifact: release-mac-arm64-lightweight
+            release_exts: '.dmg'
+            bundle: dmg,app
+            bundle_mode: lightweight
+            asset_mode: lightweight
+            prerelease: true
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            artifact: release-linux
+            release_exts: '.AppImage'
+            bundle: appimage
+            bundle_mode: all-in-one
+            asset_mode: ''
+            prerelease: false
+          # Linux arm64 AppImage (#113). The earlier "subprocess failed (exit code 2)"
+          # crash was caused by the Tauri bundle-tools cache leaking the x86_64
+          # linuxdeploy-plugin-appimage onto the aarch64 leg (now fixed by arch-scoping
+          # that cache key). With the root cause fixed, arm64 builds green (validated on
+          # v3.1.18-pre.2) and ships on BOTH stable and -pre tags like the other legs —
+          # so pre_only is false. (The pre_only gate stays as a one-line lever in case a
+          # future leg needs to be -pre-only while it is stabilized.)
+          - os: ubuntu-22.04-arm
+            platform: linux
+            arch: arm64
+            artifact: release-linux-arm64
+            release_exts: '.AppImage'
+            bundle: appimage
+            bundle_mode: all-in-one
+            asset_mode: ''
+            prerelease: true
+            pre_only: false
+          # Linux arm64 lightweight AppImage: same leg, no bundled runtimes —
+          # pairs with the in-app managed-runtime auto-install. Asset name gets
+          # the `.lightweight` suffix (BetterAgentTerminal-<ver>-arm64.lightweight.AppImage)
+          # and feeds the latest-<channel>-lightweight.json updater manifest, so
+          # a lightweight install only ever upgrades to a lightweight build.
+          - os: ubuntu-22.04-arm
+            platform: linux
+            arch: arm64
+            artifact: release-linux-arm64-lightweight
+            release_exts: '.AppImage'
+            bundle: appimage
+            bundle_mode: lightweight
+            asset_mode: lightweight
+            prerelease: true
+            pre_only: false
+
+    # Every non-Windows leg uses its matrix.os verbatim. The Windows legs take
+    # whatever `verify` decided — ["windows-2025"] unless a self-hosted runner
+    # is opted in and (when RUNNER_STATUS_TOKEN allows checking) actually online.
+    # verify's step always runs and always writes valid JSON, so fromJSON here
+    # never sees an empty or malformed value.
+    runs-on: ${{ matrix.platform == 'win' && fromJSON(needs.verify.outputs.win_labels) || matrix.os }}
+    timeout-minutes: 90
+    # Each leg publishes its own installer straight to the release page.
+    permissions:
+      contents: write
+    env:
+      # pre_only legs (e.g. linux arm64) build ONLY on -pre tags and are skipped on
+      # stable tags, so an unstable leg can never block a stable release. All other
+      # legs follow the usual rule: build on stable tags, or on -pre tags when the leg
+      # opts in via prerelease: true.
+      BUILD_MATRIX_ENTRY: ${{ (matrix.pre_only && contains(inputs.release_tag, '-pre')) || (!matrix.pre_only && (!contains(inputs.release_tag, '-pre') || matrix.prerelease)) }}
+
+    steps:
+      - name: Skip non-prerelease target
+        if: env.BUILD_MATRIX_ENTRY != 'true'
+        run: echo "Skipping ${{ matrix.artifact }} for prerelease tag ${RELEASE_TAG}"
+
+      - name: Checkout code
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          # checkout's default clean is `git clean -ffdx` + `git reset --hard`.
+          # On a hosted runner that is free — the VM is new anyway. On a reused
+          # self-hosted workspace the -x would delete every gitignored file,
+          # including src-tauri/target, which is the one thing the self-hosted
+          # runner exists to keep. Take the clean over ourselves in the next step
+          # so the target dir survives and nothing else does.
+          clean: ${{ runner.environment == 'github-hosted' }}
+
+      # Only reached on a self-hosted runner, where checkout was told not to
+      # clean. This reproduces exactly what it would have done, minus the target
+      # dir: a stale generated file surviving into a shipped bundle is a much
+      # worse failure than a slow build, so everything except src-tauri/target is
+      # still wiped. `git clean` skips excluded directories rather than walking
+      # them, so the 60k files in target/ cost nothing here.
+      - name: Reset the reused workspace, keeping only the Rust target dir
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clean -ffdx -e src-tauri/target
+          git reset --hard HEAD
+          # Keep the compiled crates, but never the previous leg's installers.
+          # The two Windows legs share this target dir back to back, and the
+          # lightweight leg's renamed .exe made the all-in-one leg's
+          # normalize-release-asset-names fail with "target already exists"
+          # (first seen on v3.2.14-pre.2). Bundles are cheap to regenerate.
+          rm -rf src-tauri/target/release/bundle
+          # Deliberately not `du -sh`: sizing 60k files on Windows costs more than
+          # the line is worth. Existence is the only thing worth reporting, since
+          # it is the difference between a ~10s and a ~200s cargo step.
+          if [ -d src-tauri/target ]; then
+            echo "src-tauri/target survived the reset — incremental build expected"
+          else
+            echo "src-tauri/target absent — first run on this runner, expect a cold build"
+          fi
+
+      # The payoff for keeping the target dir. Incremental caches at codegen-unit
+      # level *inside* our crate, which is where 97% of the build time is (the
+      # front end for all 34k lines is 4.5s; LLVM optimising them is ~155s), so it
+      # gives us the benefit of splitting the crate with none of the refactor.
+      # Measured locally on the release profile: 196.9s cold -> 10.3-12.8s warm.
+      #
+      # Hosted runners must stay at the default 0. Their target dir arrives from
+      # Swatinem/rust-cache, and rust-cache deletes incremental/ before saving
+      # (cleanup.ts keeps an allowlist of build/.fingerprint/deps), so paying to
+      # generate 0.8-1.6 GB of incremental state there buys nothing and would
+      # crowd the 10 GB repo cache quota. Skipping rust-cache on self-hosted also
+      # means nothing is left to force CARGO_INCREMENTAL=0 behind our back.
+      - name: Turn on incremental compilation for the reused target dir
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'self-hosted'
+        shell: bash
+        run: echo "CARGO_INCREMENTAL=1" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            node-sidecar/pnpm-lock.yaml
+
+      - name: Setup Rust
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      # NOTE: do not reintroduce sccache here. Measured on v3.1.53, all 11 build
+      # jobs reported "0% - 0 hits, 1 miss". It cannot hit by construction: the
+      # rust-cache step below restores every dependency (sccache saw only 8
+      # compile requests for the entire build), so the only thing left to compile
+      # is our own crate, whose source hash changes on every commit — and its bin
+      # and cdylib outputs are crate-type-uncacheable anyway. The cost was not
+      # zero: sccache wrote a GHA cache entry per compile, 823 of them totalling
+      # ~1 GB, against a repo cache quota of 10 GB that was already full. Being
+      # pinned at the cap makes GitHub evict least-recently-used entries, and the
+      # entries worth having are the 600-735 MB rust-cache target dirs below.
+      # Losing one costs a full dependency rebuild — which is why release runs
+      # have swung between 9 and 34 minutes for the same amount of work.
+      - name: Ensure Rust shims are first on PATH
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        shell: bash
+        run: |
+          RUST_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+          echo "$RUST_BIN" >> "$GITHUB_PATH"
+          export PATH="$RUST_BIN:$PATH"
+          command -v rustup
+          command -v cargo
+          "$RUST_BIN/cargo" --version
+
+      - name: Install Linux Tauri dependencies
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          # The lean ubuntu-*-arm hosted runner image does NOT preinstall the
+          # runtime helper tools that Tauri's AppImage bundler and the linuxdeploy
+          # gtk plugin shell out to (xdg-open, plus the *-bin tools: rsvg-convert,
+          # gdk-pixbuf-query-loaders, glib-compile-schemas, gtk-update-icon-cache).
+          # On the x64 ubuntu image these are already present; install them
+          # explicitly so the AppImage bundle step works on arm64 too.
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            librsvg2-bin \
+            libgdk-pixbuf2.0-bin \
+            libglib2.0-bin \
+            libgtk-3-bin
+          if apt-cache show libfuse2t64 >/dev/null 2>&1; then
+            sudo apt-get install -y libfuse2t64
+          else
+            sudo apt-get install -y libfuse2
+          fi
+
+      - name: Configure Linux AppImage tooling
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'linux'
+        shell: bash
+        run: |
+          # Tauri shells out to linuxdeploy AppImages. GitHub runners can be
+          # unreliable for FUSE-backed AppImage execution, and linuxdeploy's
+          # bundled strip can fail on newer ELF sections from system libraries.
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+          echo "NO_STRIP=true" >> "$GITHUB_ENV"
+          dpkg-query -W libfuse2 libfuse2t64 2>/dev/null || true
+
+      - name: Compute Rust base cache key
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        id: rust-base-cache-key
+        run: node scripts/rust-base-cache-key.mjs
+
+      # Cargo registry, Rust target dir and Tauri bundle tool caches are
+      # hosted-only. On a self-hosted runner they are worse than
+      # useless: ~/.cargo, src-tauri/target and the Tauri tool cache all live
+      # outside the git tree, so they already survive the reset above and
+      # restoring them is redundant. *Saving* them is actively harmful — 600-735
+      # MB per leg into a 10 GB repo quota that is already pinned at the cap, so
+      # GitHub evicts least-recently-used entries, and the entries worth keeping
+      # are the macOS and Linux legs' target dirs. Losing one costs a full
+      # dependency rebuild (the difference between a 9- and a 30-minute release).
+      # A self-hosted Windows leg must not buy its own speed with everyone else's.
+      #
+      # The three caches further down (node-sidecar/runtime,
+      # node-sidecar/dist-node_modules, codex-runtime) are deliberately NOT gated:
+      # they sit inside the work tree, so the reset above deletes them on every
+      # self-hosted run and the cache is the only thing that brings them back.
+      # They are also content-keyed downloads, which is what makes reusing them
+      # safe at all — persisting them locally instead would skip that check.
+      - name: Cache Cargo registry base
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'github-hosted'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-base-${{ steps.rust-base-cache-key.outputs.base }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-registry-base-
+
+      - name: Cache Tauri bundle tools
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'github-hosted'
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/tauri
+            ~/.cache/tauri-apps
+            ~/.cache/linuxdeploy
+          # MUST include matrix.arch. ~/.cache/tauri holds linuxdeploy + the
+          # arch-agnostic-named linuxdeploy-plugin-appimage.AppImage. Keying only on
+          # runner.os ("Linux" for both x64 and arm64) let the x86_64 leg's cache
+          # restore onto the aarch64 leg; tauri re-fetched linuxdeploy-aarch64 but
+          # reused the cached x86_64 appimage plugin, so linuxdeploy aborted at
+          # startup with "subprocess failed (exit code 2)" (Exec format error) — the
+          # #113 arm64 failure. Every other cache below is already arch-scoped.
+          key: ${{ runner.os }}-${{ matrix.arch }}-tauri-tools-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-tauri-tools-
+
+      - name: Compute Tauri resource cache keys
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.bundle_mode == 'all-in-one'
+        id: tauri-resource-cache-keys
+        run: node scripts/tauri-resource-cache-keys.mjs
+
+      - name: Cache bundled Node runtime
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.bundle_mode == 'all-in-one'
+        continue-on-error: true
+        id: node-runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: node-sidecar/runtime
+          key: ${{ runner.os }}-${{ matrix.arch }}-node-runtime-${{ steps.tauri-resource-cache-keys.outputs.node_runtime }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-node-runtime-
+
+      - name: Cache sidecar native modules
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.bundle_mode == 'all-in-one'
+        continue-on-error: true
+        id: sidecar-native-modules-cache
+        uses: actions/cache@v4
+        with:
+          path: node-sidecar/dist-node_modules
+          key: ${{ runner.os }}-${{ matrix.arch }}-sidecar-native-modules-${{ steps.tauri-resource-cache-keys.outputs.sidecar_native_modules }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-sidecar-native-modules-
+
+      - name: Cache prepared Codex runtime
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.bundle_mode == 'all-in-one'
+        continue-on-error: true
+        id: codex-runtime-cache
+        uses: actions/cache@v4
+        with:
+          path: codex-runtime
+          key: ${{ runner.os }}-${{ matrix.arch }}-codex-runtime-${{ steps.tauri-resource-cache-keys.outputs.codex_runtime }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-codex-runtime-
+
+      - name: Install dependencies
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Extract version from tag
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        id: version
+        shell: bash
+        run: echo "VERSION=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Update version metadata
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: pnpm run update:release-version
+
+      - name: Verify macOS signing secrets
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'mac'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE || secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD || secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          test -n "$APPLE_CERTIFICATE" || (echo "Missing APPLE_CERTIFICATE or APPLE_CERTIFICATE_P12 secret" && exit 1)
+          test -n "$APPLE_CERTIFICATE_PASSWORD" || (echo "Missing APPLE_CERTIFICATE_PASSWORD secret" && exit 1)
+          test -n "$APPLE_ID" || (echo "Missing APPLE_ID secret" && exit 1)
+          test -n "$APPLE_PASSWORD" || (echo "Missing APPLE_PASSWORD or APPLE_APP_SPECIFIC_PASSWORD secret" && exit 1)
+          test -n "$APPLE_TEAM_ID" || (echo "Missing APPLE_TEAM_ID secret" && exit 1)
+
+      - name: Verify Apple notarization credentials
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'mac' && env.RUN_RELEASE_VERIFICATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD || secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "Testing notarytool credentials..."
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" 2>&1 || true
+
+      - name: Prepare Tauri bundle resources
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        shell: bash
+        run: |
+          node scripts/prepare-tauri-bundle-mode.mjs --mode=${{ matrix.bundle_mode }}
+          if [[ "${{ matrix.bundle_mode }}" == "lightweight" ]]; then
+            pnpm run prepare:tauri-bundle:ci:lightweight
+            pnpm run verify:tauri-preview-readiness:lightweight
+          else
+            node scripts/fetch-node-runtime.mjs
+            pnpm --dir node-sidecar install --frozen-lockfile --prefer-offline
+            pnpm run build:tauri-sidecar
+            if [[ "${{ steps.sidecar-native-modules-cache.outputs.cache-hit }}" == "true" ]]; then
+              echo "Prepared sidecar native modules restored from cache."
+            else
+              pnpm run prune:tauri-sidecar
+              pnpm run prepare:tauri-sidecar-node-modules
+            fi
+            if [[ "${{ steps.codex-runtime-cache.outputs.cache-hit }}" == "true" ]]; then
+              echo "Prepared Codex runtime restored from cache."
+            else
+              pnpm run prepare:tauri-codex-runtime
+            fi
+            pnpm run verify:tauri-preview-readiness:all-in-one
+          fi
+
+      - name: Compute stable Rust crate cache key
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'github-hosted'
+        run: node scripts/stable-rust-crates-cache.mjs prepare
+
+      # Keep workspace rlibs as well as registry dependencies. The source key
+      # participates in the manifest hash; restore verifies it before backdating
+      # source files, so fresh checkout timestamps cannot force a stable rebuild.
+      # Failure caches cannot carry a successful build's source verification.
+      - name: Cache Rust build outputs
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'github-hosted'
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: release-${{ matrix.platform }}-${{ matrix.arch }}
+          key: base-${{ steps.rust-base-cache-key.outputs.base }}
+          cache-on-failure: false
+          # ~/.cargo/bin is freshly populated by dtolnay/rust-toolchain on
+          # every run. Caching it means a later restore can overwrite the
+          # fresh rustup shims with stale binaries — on macOS-14 this has
+          # surfaced as `cargo metadata` invoking the rustup-init installer
+          # instead of cargo. Skip the bin cache; only target/ + registry
+          # caches matter for build speed.
+          cache-bin: "false"
+          cache-workspace-crates: "true"
+          cache-directories: .bat-rust-cache
+
+      - name: Restore stable Rust crate timestamps
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'github-hosted'
+        run: node scripts/stable-rust-crates-cache.mjs restore
+
+      - name: Sign macOS resource binaries
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'mac' && matrix.bundle_mode == 'all-in-one'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE || secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: bash scripts/sign-macos-resource-binaries.sh
+
+      - name: Build Linux Tauri release bundle
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'linux'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE || secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD || secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_PROVIDER_SHORT_NAME: ${{ secrets.APPLE_PROVIDER_SHORT_NAME }}
+          # Sign the updater artifacts (.AppImage.sig) with the minisign key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+          # On arm64 the linuxdeploy gtk plugin has been failing with a generic
+          # "subprocess failed (exit code 2)". The plugin is a bash script that turns
+          # on `set -x` when DEBUG is set, so this surfaces the exact failing
+          # subprocess inline in the build log. Harmless on the x64 leg, but scoped
+          # to arm64 to keep stable x64 logs clean.
+          DEBUG: ${{ matrix.arch == 'arm64' && '1' || '' }}
+        run: node scripts/tauri-build-mode.mjs --mode ${{ matrix.bundle_mode }} --bundles ${{ matrix.bundle }} --verbose
+
+      - name: Diagnose arm64 AppImage failure
+        if: ${{ failure() && matrix.platform == 'linux' && matrix.arch == 'arm64' }}
+        shell: bash
+        run: |
+          set +e
+          echo "===== arch / os ====="
+          uname -a
+          echo "===== gtk-plugin runtime tools (linuxdeploy-plugin-gtk depends on these) ====="
+          for tool in gdk-pixbuf-query-loaders gdk-pixbuf-query-loaders-64 gtk-update-icon-cache glib-compile-schemas rsvg-convert update-mime-database; do
+            printf '%-32s ' "$tool:"
+            command -v "$tool" || echo "MISSING"
+          done
+          echo "===== gdk-pixbuf loader dir (arm64 path) ====="
+          ls -la /usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/*/loaders/ 2>&1 | head -50
+          find /usr -name 'gdk-pixbuf-query-loaders*' 2>/dev/null
+          echo "===== ~/.cache/tauri (linuxdeploy + plugins downloaded by tauri) ====="
+          ls -la "$HOME/.cache/tauri" 2>&1
+          echo "===== AppDir state (partial bundle before crash) ====="
+          ls -laR src-tauri/target/release/bundle/appimage 2>&1 | head -120
+          echo "===== linuxdeploy plugin list ====="
+          LD="$(find "$HOME/.cache/tauri" -name 'linuxdeploy-*.AppImage' 2>/dev/null | head -1)"
+          if [ -n "$LD" ]; then
+            echo "linuxdeploy: $LD"
+            APPIMAGE_EXTRACT_AND_RUN=1 "$LD" --list-plugins 2>&1 | head -40
+          else
+            echo "no linuxdeploy AppImage found in ~/.cache/tauri"
+          fi
+          echo "===== ldd of main binary (missing libs surface here) ====="
+          BIN="$(find src-tauri/target/release -maxdepth 1 -type f -executable 2>/dev/null | head -1)"
+          [ -n "$BIN" ] && ldd "$BIN" 2>&1 | grep -i 'not found' || echo "(no missing libs / binary not found)"
+          exit 0
+
+      - name: Build Tauri release bundle
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform != 'linux'
+        env:
+          # This step covers mac AND win (platform != linux), but only mac can use
+          # an Apple credential — nothing in a Windows build codesigns or notarizes
+          # with Apple, and scripts/tauri-build-mode.mjs reads none of these (the
+          # consumer is Tauri's macOS bundler/notarizer). So gate them per-platform
+          # instead of handing all seven to a leg that cannot use them.
+          #
+          # This is what keeps a self-hosted Windows runner cheap to trust: the
+          # only secrets that reach it are the ones it genuinely needs.
+          APPLE_CERTIFICATE: ${{ matrix.platform == 'mac' && (secrets.APPLE_CERTIFICATE || secrets.APPLE_CERTIFICATE_P12) || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.platform == 'mac' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_ID: ${{ matrix.platform == 'mac' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ matrix.platform == 'mac' && (secrets.APPLE_PASSWORD || secrets.APPLE_APP_SPECIFIC_PASSWORD) || '' }}
+          APPLE_TEAM_ID: ${{ matrix.platform == 'mac' && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'mac' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_PROVIDER_SHORT_NAME: ${{ matrix.platform == 'mac' && secrets.APPLE_PROVIDER_SHORT_NAME || '' }}
+          # Both platforms genuinely need this one: it signs the updater artifacts
+          # (.app.tar.gz.sig on mac, -setup.exe.sig on win) with the minisign key
+          # matching the pubkey in tauri.conf.json.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node scripts/tauri-build-mode.mjs --mode ${{ matrix.bundle_mode }} --bundles ${{ matrix.bundle }}
+
+      - name: Record built stable Rust crates
+        if: env.BUILD_MATRIX_ENTRY == 'true' && runner.environment == 'github-hosted'
+        run: node scripts/stable-rust-crates-cache.mjs record
+
+      - name: Normalize release asset names
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        env:
+          BAT_RELEASE_PLATFORM: ${{ matrix.platform }}
+          BAT_RELEASE_ARCH: ${{ matrix.arch }}
+          BAT_RELEASE_BUNDLE_MODE: ${{ matrix.asset_mode }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: node scripts/normalize-release-asset-names.mjs src-tauri/target/release/bundle
+
+      - name: Stage updater artifacts
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        env:
+          BAT_RELEASE_PLATFORM: ${{ matrix.platform }}
+          BAT_RELEASE_ARCH: ${{ matrix.arch }}
+          BAT_BUNDLE_MODE: ${{ matrix.bundle_mode }}
+          BAT_RELEASE_BUNDLE_MODE: ${{ matrix.asset_mode }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: node scripts/stage-updater-artifacts.mjs src-tauri/target/release/bundle updater-meta
+
+      - name: Smoke test Windows release binary
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'win' && env.RUN_RELEASE_VERIFICATION == 'true'
+        run: pnpm run test:tauri-launch
+
+      - name: Verify Tauri release asset sizes
+        if: env.BUILD_MATRIX_ENTRY == 'true' && env.RUN_RELEASE_VERIFICATION == 'true'
+        env:
+          BAT_RELEASE_PLATFORM: ${{ matrix.platform }}
+          BAT_RELEASE_EXTS: ${{ matrix.release_exts }}
+        run: node scripts/verify-release-asset-sizes.js src-tauri/target/release/bundle
 
       - name: Upload Windows artifact
-        if: matrix.platform == 'win'
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'win'
         uses: actions/upload-artifact@v4
         with:
-          name: release-win
+          name: ${{ matrix.artifact }}
           path: |
-            release/*.zip
-            release/*.exe
+            src-tauri/target/release/bundle/**/*.exe
 
       - name: Upload macOS artifact
-        if: matrix.platform == 'mac'
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'mac'
         uses: actions/upload-artifact@v4
         with:
-          name: release-mac
-          path: release/*.dmg
+          name: ${{ matrix.artifact }}
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            !src-tauri/target/release/bundle/**/rw.*.dmg
 
       - name: Upload Linux artifact
-        if: matrix.platform == 'linux'
+        if: env.BUILD_MATRIX_ENTRY == 'true' && matrix.platform == 'linux'
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux
-          path: release/*.AppImage
+          name: ${{ matrix.artifact }}
+          path: |
+            src-tauri/target/release/bundle/**/*.AppImage
 
+      # Deliberately ahead of the updater metadata upload. If publishing the
+      # installer fails, this step fails and the metadata never ships either —
+      # which is what we want, because a manifest entry pointing at an asset
+      # that is not on the release page would hand every client a 404.
+      - name: Publish this platform's installer to the release
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # `find`, not a `**` glob. macOS runners still ship bash 3.2, where
+          # `shopt -s globstar` is not merely unsupported but fatal under `set -e`:
+          # "shopt: globstar: invalid shell option name", exit 1. It killed both
+          # mac arm64 legs of v3.1.54-pre.2 after they had already built, and it is
+          # invisible on Linux and Windows whose bash is 4.4+. The other `**`
+          # patterns in this file are upload-artifact `path:` inputs, globbed by
+          # @actions/glob rather than by a shell, so they are unaffected.
+          #
+          # `< <(find ...)` rather than `find ... | while`: a pipeline would run the
+          # loop in a subshell and `published` would come back 0 every time.
+          # bundle_dmg.sh leaves an `rw.*.dmg` scratch image next to the real one.
+          published=0
+          while IFS= read -r asset; do
+            echo "uploading $(basename "$asset")"
+            gh release upload "$RELEASE_TAG" "$asset" --clobber
+            published=$((published + 1))
+          done < <(find src-tauri/target/release/bundle -type f \
+                     \( -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' \) \
+                     ! -name 'rw.*.dmg' | sort)
+          if [ "$published" -eq 0 ]; then
+            echo "::error::no installer found to publish for ${{ matrix.artifact }}"
+            exit 1
+          fi
+
+      - name: Upload updater metadata
+        if: env.BUILD_MATRIX_ENTRY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-meta-${{ matrix.artifact }}
+          # The whole dir: updater-meta.json plus, for mac/linux, the separate
+          # *.tar.gz updater bundle copied alongside it. generate-update-manifest
+          # republishes those tarballs to the pinned `manifests` release.
+          path: updater-meta
+          if-no-files-found: error
+
+  # Runs once the matrix has settled, whatever the outcome. The installers are
+  # already on the release page — each leg put its own there — so this only has
+  # to do the parts that need a whole-release view: the update manifests, the
+  # Homebrew bump, and clearing the "builds in progress" banner.
+  #
+  # `always()` is the point of the job: a matrix with one failed leg still needs
+  # manifests published for the legs that worked. Only a failure to open the
+  # release page in the first place stops it.
   release:
-    needs: build
+    needs: [create-release, build]
+    if: ${{ always() && needs.create-release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download all artifacts
+      # Checkout first: actions/checkout cleans the workspace, which would wipe
+      # the downloaded artifacts/ dir if it ran afterwards.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Only the updater sidecars. The installers are not downloaded any more —
+      # they went straight from each build leg to the release page, and
+      # generate-update-manifest reads nothing but updater-meta.json plus the
+      # *.tar.gz bundles staged beside it.
+      - name: Download updater metadata
         uses: actions/download-artifact@v4
         with:
+          pattern: updater-meta-*
           path: artifacts
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            artifacts/release-win/*
-            artifacts/release-mac/*
-            artifacts/release-linux/*
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${RELEASE_TAG#v}" >> $GITHUB_OUTPUT
+
+      - name: Report which platforms made it
+        id: legs
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          assets=$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[].name] | sort | .[]')
+          echo "published assets:"
+          echo "$assets" | sed 's/^/  /'
+          # The Homebrew cask installs the macOS build; bumping the tap when no
+          # .dmg shipped would point users at a download that does not exist.
+          if echo "$assets" | grep -q '\.dmg$'; then
+            echo "has_mac=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_mac=false" >> $GITHUB_OUTPUT
+            echo "::warning::no .dmg on the release; skipping the Homebrew tap update"
+          fi
+          {
+            echo 'list<<EOF'
+            echo "$assets" | sed 's/^/- /'
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      - name: Generate update manifests
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: node scripts/generate-update-manifest.mjs artifacts manifests-out
+
+      - name: Validate update manifests
+        run: |
+          node -e '
+            const fs = require("fs");
+            const dir = "manifests-out";
+            const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+            if (files.length === 0) throw new Error("no manifests generated");
+            for (const f of files) {
+              const m = JSON.parse(fs.readFileSync(dir + "/" + f, "utf8"));
+              if (!m.version || typeof m.version !== "string") throw new Error(f + ": missing version");
+              if (!m.platforms || typeof m.platforms !== "object") throw new Error(f + ": missing platforms");
+              const keys = Object.keys(m.platforms);
+              if (keys.length === 0) throw new Error(f + ": empty platforms");
+              for (const k of keys) {
+                const p = m.platforms[k];
+                if (!p.url || !/^https:\/\//.test(p.url)) throw new Error(f + ": " + k + " bad url");
+                if (!p.signature) throw new Error(f + ": " + k + " missing signature");
+                // Updater bundles we republish to the `manifests` release must be
+                // present locally so the publish step actually uploads them.
+                if (p.url.includes("/releases/download/manifests/")) {
+                  const fname = p.url.split("/").pop();
+                  if (!fs.existsSync(dir + "/" + fname)) throw new Error(f + ": " + k + " references missing manifests asset " + fname);
+                }
+              }
+              console.log("✓ " + f + " (" + keys.join(", ") + ")");
+            }
+          '
+
+      - name: Ensure manifests release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view manifests >/dev/null 2>&1 || \
+            gh release create manifests \
+              --title "Updater manifests" \
+              --notes "Auto-update channel manifests. Do not delete — endpoints point here." \
+              --latest=false
+
+      - name: Publish update manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Uploads the latest-*.json manifests AND the fixed-name updater bundles
+        # (*.app.tar.gz / *.AppImage.tar.gz). --clobber overwrites the previous
+        # release's bundles so the pinned release never accumulates old versions.
+        run: gh release upload manifests manifests-out/* --clobber
+
+      - name: Update Homebrew tap
+        if: ${{ !contains(env.RELEASE_TAG, '-pre') && steps.legs.outputs.has_mac == 'true' }}
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          repository: tonyq-org/homebrew-tap
+          event-type: update-cask
+          client-payload: '{"version": "${{ steps.version.outputs.VERSION }}"}'
+
+      - name: Update Homebrew tap (pre-release)
+        if: ${{ contains(env.RELEASE_TAG, '-pre') && steps.legs.outputs.has_mac == 'true' }}
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          repository: tonyq-org/homebrew-tap
+          event-type: update-cask-pre
+          client-payload: '{"version": "${{ steps.version.outputs.VERSION }}"}'
+
+      # Last, so the banner only clears once the manifests are live and the tap
+      # has been told. What lands on the page is the plain generated changelog
+      # again, plus a note if any platform is missing — better than silently
+      # shipping a short asset list that looks complete.
+      - name: Clear the in-progress banner
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          body=$(gh release view "$RELEASE_TAG" --json body --jq .body)
+          # Drop the banner line create-release prepended, and the blank line after it.
+          printf '%s' "$body" | sed '/^> ⏳ \*\*Builds in progress\.\*\*/,+1d' > release-notes.md
+          if [ "$BUILD_RESULT" != "success" ]; then
+            {
+              echo
+              echo "> ⚠️ **Some platforms did not build.** Only the installers listed above are available for this version."
+              echo "> See [the workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+            } >> release-notes.md
+          fi
+          gh release edit "$RELEASE_TAG" --notes-file release-notes.md
+
+  choco:
+    needs: [build, release]
+    # `always()` for the same reason as `release`: a failed Linux or macOS leg
+    # says nothing about whether the Windows installer is publishable.
+    if: ${{ always() && !contains(inputs.release_tag, '-pre') && needs.release.result == 'success' }}
+    # Deliberately still windows-latest: this job downloads a built artifact and
+    # checksums it, so it never runs node-gyp and the VS 2026 problem that pins
+    # the build legs to windows-2025 cannot reach it.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check if Chocolatey publish is enabled
+        id: gate
+        shell: bash
+        run: |
+          # Chocolatey package pending review — skip until after 2026-04-30 UTC
+          if [[ "$(date -u +%Y%m%d)" -lt "20260501" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Skipping: Chocolatey package not yet approved"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome == 'success'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # Tolerated, not required: if the Windows leg is the one that failed there
+      # is no artifact to package, and that must not fail the run — the other
+      # platforms have already shipped.
+      - name: Download Windows artifact
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome == 'success'
+        id: winartifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: release-win-all-in-one
+          path: artifacts
+
+      - name: Skip Chocolatey without a Windows installer
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome != 'success'
+        shell: bash
+        run: echo "::warning::the Windows leg produced no artifact; skipping the Chocolatey push"
+
+      - name: Extract version from tag
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome == 'success'
+        id: version
+        shell: bash
+        run: echo "VERSION=${RELEASE_TAG#v}" >> $GITHUB_OUTPUT
+
+      - name: Find installer and compute checksum
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome == 'success'
+        id: checksum
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path artifacts -Recurse -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "No .exe found in artifacts" }
+          Write-Host "Found installer: $($exe.Name)"
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+          echo "SHA256=$hash" >> $env:GITHUB_OUTPUT
+          echo "EXE_NAME=$($exe.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare Chocolatey package
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome == 'success'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $checksum = "${{ steps.checksum.outputs.SHA256 }}"
+          $exeName = "${{ steps.checksum.outputs.EXE_NAME }}"
+
+          # Update version in nuspec
+          $nuspec = Get-Content choco/better-agent-terminal.nuspec -Raw
+          $nuspec = $nuspec -replace '<version>.*?</version>', "<version>$version</version>"
+          Set-Content choco/better-agent-terminal.nuspec $nuspec
+
+          # Update checksum and Tauri installer filename in install script
+          $install = Get-Content choco/tools/chocolateyinstall.ps1 -Raw
+          $install = $install -replace '__CHECKSUM64__', $checksum
+          $install = $install -replace '__EXE_NAME__', $exeName
+          Set-Content choco/tools/chocolateyinstall.ps1 $install
+
+      - name: Pack and push
+        if: steps.gate.outputs.skip != 'true' && steps.winartifact.outcome == 'success'
+        shell: pwsh
+        run: |
+          choco pack choco/better-agent-terminal.nuspec --output-directory .
+          $nupkg = Get-ChildItem -Filter "*.nupkg" | Select-Object -First 1
+          if (-not $nupkg) { throw "choco pack failed - no .nupkg file created" }
+          Write-Host "Pushing $($nupkg.Name)..."
+          choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key "${{ secrets.CHOCO_API_KEY }}"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Chocolatey push failed with exit code $LASTEXITCODE; release artifacts were already published."
+            exit 0
+          }
+
+  # Self-contained, install-and-go Linux server bundles for the tauri-free
+  # `bat-server` (no WebKit, no xvfb, no manual sidecar provisioning). Compile in
+  # parallel with the desktop matrix; a separate publish job waits for the GitHub
+  # release, so a server failure can never block the desktop release.
+  #
+  # Matrixed over both Linux arches, each on a NATIVE runner (mirroring the
+  # desktop build's ubuntu-22.04-arm leg): x86_64 and aarch64. The aarch64 leg is
+  # the actual #117 target (Oracle Linux 9 / glibc 2.34 ARM hosts) — the static
+  # musl binary has zero glibc requirement, so the bundle floor is set by the
+  # bundled Node runtime (glibc >= 2.28). fail-fast: false so a flaky ARM runner
+  # can't stop the x86_64 bundle from publishing, and vice versa.
+  bat-server-build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            bundle_target: linux-x86_64
+            rust_target: x86_64-unknown-linux-musl
+            appimage_arch: x86_64
+            aarch64_rustflags: ''
+          - os: ubuntu-22.04-arm
+            bundle_target: linux-aarch64
+            rust_target: aarch64-unknown-linux-musl
+            appimage_arch: aarch64
+            # libdbus is compiled by GCC and uses the AArch64 atomic helpers
+            # from libgcc. rustc links with -nodefaultlibs, so request libgcc
+            # explicitly or the final static link misses __aarch64_ldadd4_sync.
+            aarch64_rustflags: '-C link-arg=-lgcc'
+    runs-on: ${{ matrix.os }}
+    # Normal duration is well under an hour; without a cap a hung apt/runner
+    # zombie holds the run "in_progress" for 12h+ (seen on v3.1.37-pre.2).
+    timeout-minutes: 60
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.aarch64_rustflags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            node-sidecar/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      # No sccache here either — see the note in the desktop build job above.
+      - name: Compute Rust base cache key
+        id: rust-base-cache-key
+        run: node scripts/rust-base-cache-key.mjs
+
+      - name: Install libfuse2 (appimagetool runtime) + musl toolchain
+        run: |
+          sudo apt-get update
+          if apt-cache show libfuse2t64 >/dev/null 2>&1; then
+            sudo apt-get install -y libfuse2t64
+          else
+            sudo apt-get install -y libfuse2
+          fi
+          # musl-gcc compiles the C deps (ring, vendored libdbus, zstd,
+          # mimalloc) for the fully static bat-server build below. On the
+          # native aarch64 runner this same package yields an aarch64 musl-gcc.
+          sudo apt-get install -y musl-tools
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Update version metadata
+        run: pnpm run update:release-version
+
+      - name: Prepare bundle resources (${{ matrix.bundle_target }}, all-in-one)
+        run: |
+          node scripts/fetch-node-runtime.mjs --target=${{ matrix.bundle_target }}
+          pnpm --dir node-sidecar install --frozen-lockfile --prefer-offline
+          pnpm run build:tauri-sidecar
+          pnpm run prune:tauri-sidecar
+          pnpm run prepare:tauri-sidecar-node-modules
+          # Codex is optional; a failure here just yields a Claude-only bundle.
+          pnpm run prepare:tauri-codex-runtime || echo "codex runtime prep failed; bundle will be Claude-only"
+
+      - name: Compute stable Rust crate cache key
+        run: node scripts/stable-rust-crates-cache.mjs prepare
+
+      - name: Cache bat-server Rust build outputs
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: bat-server-${{ matrix.bundle_target }}
+          key: base-${{ steps.rust-base-cache-key.outputs.base }}
+          cache-on-failure: false
+          cache-bin: "false"
+          cache-workspace-crates: "true"
+          cache-directories: .bat-rust-cache
+
+      - name: Restore stable Rust crate timestamps
+        run: node scripts/stable-rust-crates-cache.mjs restore
+
+      - name: Build bat-server (headless, static musl)
+        # Static musl build so the server runs on any Linux regardless of
+        # glibc age. Building on ubuntu-22.04 for the gnu target linked
+        # GLIBC_2.34 symbols, which refused to load on RHEL 8-era hosts
+        # (glibc 2.28). With a static binary the bundle's floor is set by the
+        # official Node runtime instead (glibc >= 2.28). Both CC_* vars are set
+        # unconditionally; cargo reads only the one matching --target.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target ${{ matrix.rust_target }} --bin bat-server --no-default-features --features headless --manifest-path src-tauri/Cargo.toml
+
+      - name: Record built stable Rust crates
+        run: node scripts/stable-rust-crates-cache.mjs record
+
+      - name: Verify bat-server is fully static
+        run: |
+          BIN=src-tauri/target/${{ matrix.rust_target }}/release/bat-server
+          file "$BIN"
+          # Rust musl targets emit "static-pie linked"; plain static would say
+          # "statically linked". Either is fine — dynamic is not.
+          file "$BIN" | grep -Eq 'statically linked|static-pie linked' || { echo "::error::bat-server is not statically linked"; exit 1; }
+
+      - name: Fetch appimagetool
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+
+      - name: Assemble self-contained bundle (tar.gz + AppImage)
+        run: |
+          node scripts/build-bat-server-bundle.mjs \
+            --bin src-tauri/target/${{ matrix.rust_target }}/release/bat-server \
+            --target ${{ matrix.bundle_target }} \
+            --appimage \
+            --out dist-bat-server
+
+      - name: Upload bat-server bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bat-server-${{ matrix.bundle_target }}
+          path: |
+            dist-bat-server/bat-server-${{ matrix.bundle_target }}.tar.gz
+            dist-bat-server/bat-server-${{ matrix.appimage_arch }}.AppImage
+          if-no-files-found: error
+
+  bat-server-publish:
+    # Only the release page needs to exist, not the desktop matrix. The server
+    # bundles are independent deliverables, so they land as soon as they are
+    # built rather than queueing behind the slowest desktop leg.
+    needs: [create-release, bat-server-build]
+    if: ${{ always() && needs.create-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # One architecture is allowed to fail independently. Download and publish
+      # every artifact that the successful matrix legs produced.
+      - name: Download available bat-server bundles
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bat-server-*
+          path: dist-bat-server
+          merge-multiple: true
+
+      - name: Publish bat-server bundles to the release
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          find dist-bat-server -type f \( -name '*.tar.gz' -o -name '*.AppImage' \) -print0 | \
+            while IFS= read -r -d '' asset; do
+              gh release upload "$RELEASE_TAG" "$asset" --clobber
+            done
+
+      - name: Report missing server bundles
+        if: steps.download.outcome != 'success'
+        run: echo "No bat-server matrix artifact was available; desktop release remains published."

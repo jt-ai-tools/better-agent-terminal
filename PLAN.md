@@ -1,4 +1,6 @@
-# Better Terminal - Windows 終端聚合程式實作計畫
+# Better Terminal - Windows 終端聚合程式實作計畫（歷史文件）
+
+> 本文保留最初的 Electron 架構與實作規劃，供歷史參考。BAT 自 3.0 起採用 Rust/Tauri host、React renderer 與 Node SDK sidecar；下方的目錄、依賴及安裝步驟屬於當時的設計。現行架構與開發方式請見 [README](README.md)，專案操作規則請見 [AGENTS.md](AGENTS.md) 與 [CLAUDE.md](CLAUDE.md)。
 
 ## 專案概述
 一個 Windows 終端聚合程式，支援多工作區管理，每個工作區包含一個 Claude Code 實例和多個可多開的 Terminal。
@@ -152,9 +154,9 @@ interface AppState {
 }
 ```
 
-## UI 佈局設計（Google Meet 風格）
+## UI 佈局設計（分割面板風格）
 
-**設計理念**：主區域 (70%) + 小視窗 (30%)，類似 Google Meet
+**設計理念**：主區域 (70%) + 小視窗 (30%)，類似視訊會議的分割畫面
 
 ### 情境 A：Terminal 是焦點（最常見）
 - 主區域：當前操作的 Terminal
